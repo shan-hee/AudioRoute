@@ -173,22 +173,22 @@ public sealed partial class MainWindow : Window
         var sessions = AudioSessionService.GetActiveSessions(CurrentFlow);
 
         SummaryTextBlock.Text = CurrentFlow == EDataFlow.eRender
-            ? $"Default output: {defaultDevice?.Name ?? "No device detected"}"
-            : $"Default input: {defaultDevice?.Name ?? "No device detected"}";
+            ? $"默认输出: {defaultDevice?.Name ?? "未检测到设备"}"
+            : $"默认输入: {defaultDevice?.Name ?? "未检测到设备"}";
 
         MetaTextBlock.Text = sessions.Count == 0
             ? (CurrentFlow == EDataFlow.eRender
-                ? "Open an app that is actively playing audio and it will appear here."
-                : "Open an app that is actively recording audio and it will appear here.")
-            : $"{sessions.Count} active sessions. Routes update in place without restarting the panel.";
+                ? "打开正在播放音频的应用，它将显示在此处。"
+                : "打开正在录制音频的应用，它将显示在此处。")
+            : $"{sessions.Count} 个活跃会话，路由即时更新。";
 
         if (sessions.Count == 0)
         {
             RemoveInactiveCards(Array.Empty<string>());
             ShowPlaceholder(
                 CurrentFlow == EDataFlow.eRender
-                    ? "No active output sessions right now."
-                    : "No active input sessions right now.");
+                    ? "当前没有活跃的输出会话。"
+                    : "当前没有活跃的输入会话。");
             return;
         }
 
@@ -279,7 +279,7 @@ public sealed partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            ShowError($"Failed to change device: {ex.Message}");
+            ShowError($"更改设备失败: {ex.Message}");
         }
     }
 
@@ -291,7 +291,7 @@ public sealed partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            ShowError($"Failed to change volume: {ex.Message}");
+            ShowError($"调整音量失败: {ex.Message}");
         }
     }
 
@@ -695,7 +695,7 @@ public sealed partial class MainWindow : Window
         {
             Title = "AudioRoute",
             Content = message,
-            CloseButtonText = "OK",
+            CloseButtonText = "确定",
             XamlRoot = WindowRoot.XamlRoot
         };
 

@@ -48,7 +48,7 @@ public sealed partial class SessionCardControl : UserControl
     {
         TitleTextBlock.Text = session.DisplayName;
         ProcessTextBlock.Text = session.IsSystemSession
-            ? "System audio session"
+            ? "系统音频会话"
             : $"{session.ProcessName} | PID {session.ProcessId}";
         SessionIcon.Glyph = session.IsSystemSession ? "\uE7F5" : "\uE77B";
 
@@ -59,7 +59,7 @@ public sealed partial class SessionCardControl : UserControl
             ? session.BoundDeviceSummary
             : session.ActualDeviceSummary;
         DeviceInfoTextBlock.Text = deviceInfo;
-        ToolTipService.SetToolTip(DeviceInfoTextBlock, $"Current: {session.ActualDeviceSummary}\nTarget: {(session.CanChangeDevice ? session.BoundDeviceSummary : "N/A")}");
+        ToolTipService.SetToolTip(DeviceInfoTextBlock, $"当前: {session.ActualDeviceSummary}\n目标: {(session.CanChangeDevice ? session.BoundDeviceSummary : "不适用")}");
 
         // Device panel visibility
         DevicePanel.Visibility = session.CanChangeDevice ? Visibility.Visible : Visibility.Collapsed;
@@ -143,11 +143,11 @@ public sealed partial class SessionCardControl : UserControl
 
             if (session.CanChangeDevice)
             {
-                DeviceComboBox.Items.Add(new DeviceChoice(null, "Follow system default"));
+                DeviceComboBox.Items.Add(new DeviceChoice(null, "跟随系统默认"));
 
                 foreach (var device in devices.Where(device => device.Flow == session.Flow))
                 {
-                    var title = device.IsDefault ? $"{device.Name} [default]" : device.Name;
+                    var title = device.IsDefault ? $"{device.Name} [默认]" : device.Name;
                     DeviceComboBox.Items.Add(new DeviceChoice(device.Id, title));
                 }
 
@@ -166,7 +166,7 @@ public sealed partial class SessionCardControl : UserControl
             }
             else
             {
-                DeviceComboBox.Items.Add(new DeviceChoice(null, "System session"));
+                DeviceComboBox.Items.Add(new DeviceChoice(null, "系统会话"));
                 DeviceComboBox.SelectedIndex = 0;
             }
         }

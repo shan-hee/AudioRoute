@@ -15,7 +15,7 @@ public static class AudioSessionService
     {
         var devices = DeviceEnumerator.EnumerateDevices(flow);
         var deviceMap = devices.ToDictionary(device => device.Id, StringComparer.OrdinalIgnoreCase);
-        var defaultDeviceName = devices.FirstOrDefault(device => device.IsDefault)?.Name ?? "System Default";
+        var defaultDeviceName = devices.FirstOrDefault(device => device.IsDefault)?.Name ?? "系统默认";
         var aggregates = new Dictionary<string, SessionAggregate>(StringComparer.OrdinalIgnoreCase);
 
         using var enumerator = new MMDeviceEnumerator();
@@ -87,8 +87,8 @@ public static class AudioSessionService
                 sessionKey: BuildSessionKey(session, processId),
                 processId: 0,
                 flow: flow,
-                displayName: "System Sounds",
-                processName: "System Sounds",
+                displayName: "系统声音",
+                processName: "系统声音",
                 executablePath: null,
                 isSystemSession: true);
         }
@@ -225,7 +225,7 @@ public static class AudioSessionService
         public MixerSessionInfo ToSnapshot(EDataFlow flow, IReadOnlyDictionary<string, AudioDevice> deviceMap, string defaultDeviceName)
         {
             string? boundDeviceId = null;
-            var boundDeviceSummary = $"Follow system default ({defaultDeviceName})";
+            var boundDeviceSummary = $"跟随系统默认 ({defaultDeviceName})";
 
             if (ProcessId > 0)
             {
@@ -238,9 +238,9 @@ public static class AudioSessionService
 
             var actualSummary = actualDeviceNames.Count switch
             {
-                0 => "No active session",
+                0 => "无活跃会话",
                 1 => actualDeviceNames.First(),
-                _ => $"Multiple devices: {string.Join(", ", actualDeviceNames.Take(3))}"
+                _ => $"多个设备: {string.Join(", ", actualDeviceNames.Take(3))}"
             };
 
             return new MixerSessionInfo

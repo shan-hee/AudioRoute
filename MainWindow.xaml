@@ -5,9 +5,9 @@
     Title="AudioRoute">
     <Grid x:Name="WindowRoot" Background="Transparent" RequestedTheme="Dark">
         <Grid.Resources>
-            <SolidColorBrush x:Key="PanelBackgroundBrush" Color="#FF1C1C1C" />
-            <SolidColorBrush x:Key="PanelBorderBrush" Color="#FF333333" />
-            <SolidColorBrush x:Key="PanelRaisedBrush" Color="#FF282828" />
+            <SolidColorBrush x:Key="PanelBackgroundBrush" Color="#FF2C2C2C" />
+            <SolidColorBrush x:Key="PanelBorderBrush" Color="#FF383838" />
+            <SolidColorBrush x:Key="PanelRaisedBrush" Color="#FF333333" />
             <SolidColorBrush x:Key="PanelMutedBrush" Color="#FFB0B0B0" />
             <SolidColorBrush x:Key="AccentBrush" Color="#FF60CDFF" />
             <SolidColorBrush x:Key="SeparatorBrush" Color="#18FFFFFF" />
@@ -68,7 +68,7 @@
                     </Button>
 
                     <TextBlock Grid.Column="1"
-                               Text="Audio Mixer"
+                               Text="音量合成器"
                                FontSize="16"
                                FontWeight="SemiBold"
                                VerticalAlignment="Center" />
@@ -92,12 +92,12 @@
                             Grid.Column="0"
                             Style="{StaticResource FlowButtonStyle}"
                             Click="OutputButton_Click"
-                            Content="Output" />
+                            Content="输出" />
                     <Button x:Name="InputButton"
                             Grid.Column="1"
                             Style="{StaticResource FlowButtonStyle}"
                             Click="InputButton_Click"
-                            Content="Input" />
+                            Content="输入" />
                 </Grid>
 
                 <!-- Default device summary -->
@@ -147,7 +147,7 @@
                         Padding="16,8"
                         BorderBrush="{StaticResource SeparatorBrush}"
                         BorderThickness="0,1,0,0">
-                    <TextBlock Text="Esc to hide · Left-click tray to reopen"
+                    <TextBlock Text="按 Esc 隐藏 · 左键点击托盘重新打开"
                                Foreground="#FF666666"
                                FontSize="11"
                                HorizontalAlignment="Center" />
