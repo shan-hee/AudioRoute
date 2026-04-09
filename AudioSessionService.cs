@@ -15,7 +15,6 @@ public static class AudioSessionService
     {
         var devices = DeviceEnumerator.EnumerateDevices(flow);
         var deviceMap = devices.ToDictionary(device => device.Id, StringComparer.OrdinalIgnoreCase);
-        var defaultDeviceName = devices.FirstOrDefault(device => device.IsDefault)?.Name ?? "系统默认";
         var aggregates = new Dictionary<string, SessionAggregate>(StringComparer.OrdinalIgnoreCase);
 
         using var enumerator = new MMDeviceEnumerator();
@@ -45,7 +44,7 @@ public static class AudioSessionService
         }
 
         return aggregates.Values
-            .Select(aggregate => aggregate.ToSnapshot(flow, deviceMap, defaultDeviceName))
+            .Select(aggregate => aggregate.ToSnapshot(flow, deviceMap))
             .OrderBy(session => session.IsSystemSession ? 0 : 1)
             .ThenBy(session => session.DisplayName, StringComparer.CurrentCultureIgnoreCase)
             .ToList();
@@ -222,10 +221,10 @@ public static class AudioSessionService
             muted &= isMuted;
         }
 
-        public MixerSessionInfo ToSnapshot(EDataFlow flow, IReadOnlyDictionary<string, AudioDevice> deviceMap, string defaultDeviceName)
+        public MixerSessionInfo ToSnapshot(EDataFlow flow, IReadOnlyDictionary<string, AudioDevice> deviceMap)
         {
             string? boundDeviceId = null;
-            var boundDeviceSummary = $"跟随系统默认 ({defaultDeviceName})";
+            var boundDeviceSummary = "跟随系统默认";
 
             if (ProcessId > 0)
             {

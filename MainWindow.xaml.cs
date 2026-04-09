@@ -10,7 +10,6 @@ using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Hosting;
-using Microsoft.UI.Xaml.Input;
 using WinRT.Interop;
 using Windows.Graphics;
 
@@ -19,7 +18,7 @@ namespace AudioRoute;
 public sealed partial class MainWindow : Window
 {
     private const int PanelWidth = 400;
-    private const int PanelHeight = 660;
+    private const int PanelHeight = 460;
     private const int ScreenMargin = 18;
     private const uint TrayIconId = 1;
     private const uint TrayCallbackMessage = NativeMethods.WmApp + 1;
@@ -51,7 +50,6 @@ public sealed partial class MainWindow : Window
         Activated += OnWindowActivated;
         Closed += OnWindowClosed;
         WindowRoot.Loaded += OnWindowLoaded;
-        WindowRoot.KeyDown += OnWindowRootKeyDown;
 
         deactivateHideTimer = DispatcherQueue.GetForCurrentThread().CreateTimer();
         deactivateHideTimer.Interval = TimeSpan.FromMilliseconds(140);
@@ -71,11 +69,8 @@ public sealed partial class MainWindow : Window
             if (!isExitRequested && isPanelVisible)
                 RefreshData();
         };
-
-        UpdateFlowButtons();
     }
 
-    private EDataFlow CurrentFlow { get; set; } = EDataFlow.eRender;
     public bool IsPanelVisible => isPanelVisible;
 
     private async void OnWindowLoaded(object sender, RoutedEventArgs e)
@@ -88,7 +83,7 @@ public sealed partial class MainWindow : Window
         ConfigureWindow();
         InitializeTrayIcon();
         RefreshData();
-        await ShowPanelAsync(focusDismissButton: true);
+        await ShowPanelAsync();
     }
 
     private void OnWindowActivated(object sender, WindowActivatedEventArgs args)
@@ -100,35 +95,6 @@ public sealed partial class MainWindow : Window
             return;
 
         ScheduleDeactivateHide();
-    }
-
-    private async void DismissButton_Click(object sender, RoutedEventArgs e)
-    {
-        await HideToTrayAsync();
-    }
-
-    private void RefreshButton_Click(object sender, RoutedEventArgs e)
-    {
-        RefreshData();
-    }
-
-    private void OutputButton_Click(object sender, RoutedEventArgs e)
-    {
-        SwitchFlow(EDataFlow.eRender);
-    }
-
-    private void InputButton_Click(object sender, RoutedEventArgs e)
-    {
-        SwitchFlow(EDataFlow.eCapture);
-    }
-
-    private async void OnWindowRootKeyDown(object sender, KeyRoutedEventArgs e)
-    {
-        if (e.Key != Windows.System.VirtualKey.Escape)
-            return;
-
-        e.Handled = true;
-        await HideToTrayAsync();
     }
 
     private void RefreshData()
@@ -168,27 +134,15 @@ public sealed partial class MainWindow : Window
 
     private void RefreshDataCore()
     {
-        var devices = DeviceEnumerator.EnumerateDevices(CurrentFlow);
-        var defaultDevice = devices.Find(device => device.IsDefault);
-        var sessions = AudioSessionService.GetActiveSessions(CurrentFlow);
-
-        SummaryTextBlock.Text = CurrentFlow == EDataFlow.eRender
-            ? $"默认输出: {defaultDevice?.Name ?? "未检测到设备"}"
-            : $"默认输入: {defaultDevice?.Name ?? "未检测到设备"}";
-
-        MetaTextBlock.Text = sessions.Count == 0
-            ? (CurrentFlow == EDataFlow.eRender
-                ? "打开正在播放音频的应用，它将显示在此处。"
-                : "打开正在录制音频的应用，它将显示在此处。")
-            : $"{sessions.Count} 个活跃会话，路由即时更新。";
+        var devices = DeviceEnumerator.EnumerateDevices(EDataFlow.eAll);
+        var outputSessions = AudioSessionService.GetActiveSessions(EDataFlow.eRender);
+        var inputSessions = AudioSessionService.GetActiveSessions(EDataFlow.eCapture);
+        var sessions = MergeSessions(outputSessions, inputSessions);
 
         if (sessions.Count == 0)
         {
             RemoveInactiveCards(Array.Empty<string>());
-            ShowPlaceholder(
-                CurrentFlow == EDataFlow.eRender
-                    ? "当前没有活跃的输出会话。"
-                    : "当前没有活跃的输入会话。");
+            ShowPlaceholder("当前没有活跃的音频会话。");
             return;
         }
 
@@ -219,32 +173,6 @@ public sealed partial class MainWindow : Window
         ReplaceSessionHostChildren(desiredCards);
     }
 
-    private void SwitchFlow(EDataFlow flow)
-    {
-        if (CurrentFlow == flow)
-            return;
-
-        CurrentFlow = flow;
-        UpdateFlowButtons();
-        RefreshData();
-    }
-
-    private void UpdateFlowButtons()
-    {
-        ApplyFlowButton(OutputButton, CurrentFlow == EDataFlow.eRender);
-        ApplyFlowButton(InputButton, CurrentFlow == EDataFlow.eCapture);
-    }
-
-    private static void ApplyFlowButton(Button button, bool selected)
-    {
-        button.Background = new Microsoft.UI.Xaml.Media.SolidColorBrush(
-            selected ? Windows.UI.Color.FromArgb(255, 56, 56, 56) : Windows.UI.Color.FromArgb(10, 255, 255, 255));
-        button.BorderBrush = new Microsoft.UI.Xaml.Media.SolidColorBrush(
-            selected ? Windows.UI.Color.FromArgb(255, 96, 205, 255) : Windows.UI.Color.FromArgb(18, 255, 255, 255));
-        button.Foreground = new Microsoft.UI.Xaml.Media.SolidColorBrush(
-            selected ? Windows.UI.Color.FromArgb(255, 96, 205, 255) : Windows.UI.Color.FromArgb(180, 200, 200, 200));
-    }
-
     private FrameworkElement BuildPlaceholder(string message)
     {
         return new Border
@@ -260,6 +188,46 @@ public sealed partial class MainWindow : Window
                 Foreground = new Microsoft.UI.Xaml.Media.SolidColorBrush(Windows.UI.Color.FromArgb(255, 160, 160, 160))
             }
         };
+    }
+
+    private static IReadOnlyList<MixerAppSessionInfo> MergeSessions(
+        IReadOnlyList<MixerSessionInfo> outputSessions,
+        IReadOnlyList<MixerSessionInfo> inputSessions)
+    {
+        var groupedSessions = new Dictionary<string, (MixerSessionInfo? Output, MixerSessionInfo? Input)>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var session in outputSessions)
+        {
+            groupedSessions.TryGetValue(session.SessionKey, out var pair);
+            pair.Output = session;
+            groupedSessions[session.SessionKey] = pair;
+        }
+
+        foreach (var session in inputSessions)
+        {
+            groupedSessions.TryGetValue(session.SessionKey, out var pair);
+            pair.Input = session;
+            groupedSessions[session.SessionKey] = pair;
+        }
+
+        return groupedSessions
+            .Values
+            .Select(pair =>
+            {
+                var primarySession = pair.Output ?? pair.Input
+                    ?? throw new InvalidOperationException("会话聚合结果不能为空。");
+
+                return new MixerAppSessionInfo
+                {
+                    SessionKey = primarySession.SessionKey,
+                    PrimarySession = primarySession,
+                    OutputSession = pair.Output,
+                    InputSession = pair.Input
+                };
+            })
+            .OrderBy(session => session.IsSystemSession ? 0 : 1)
+            .ThenBy(session => session.DisplayName, StringComparer.CurrentCultureIgnoreCase)
+            .ToList();
     }
 
     private void OnDeviceChanged(object? sender, MixerDeviceChangedEventArgs e)
@@ -318,7 +286,7 @@ public sealed partial class MainWindow : Window
             return Task.CompletedTask;
         }
 
-        return ShowPanelAsync(focusDismissButton: true);
+        return ShowPanelAsync();
     }
 
     public void PrepareForExit()
@@ -333,7 +301,7 @@ public sealed partial class MainWindow : Window
         DisposeTrayIcon();
     }
 
-    private async Task ShowPanelAsync(bool focusDismissButton = false)
+    private async Task ShowPanelAsync()
     {
         if (!isConfigured || isExitRequested || isVisibilityTransitioning || isPanelVisible)
             return;
@@ -365,9 +333,6 @@ public sealed partial class MainWindow : Window
             isVisibilityTransitioning = false;
             allowDeactivateHide = isPanelVisible && !isExitRequested;
         }
-
-        if (focusDismissButton)
-            DismissButton.Focus(FocusState.Programmatic);
     }
 
     private async Task HideToTrayAsync()
@@ -404,7 +369,6 @@ public sealed partial class MainWindow : Window
         NativeMethods.SetForegroundWindow(hwnd);
         NativeMethods.SetTopMost(hwnd);
         allowDeactivateHide = true;
-        DismissButton.Focus(FocusState.Programmatic);
     }
 
     private void ScheduleDeactivateHide()

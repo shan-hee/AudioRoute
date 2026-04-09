@@ -10,35 +10,9 @@
         <Grid.Resources>
             <SolidColorBrush x:Key="PanelBackgroundBrush" Color="Transparent" />
             <SolidColorBrush x:Key="PanelBorderBrush" Color="#FF383838" />
-            <SolidColorBrush x:Key="PanelRaisedBrush" Color="#FF333333" />
-            <SolidColorBrush x:Key="PanelMutedBrush" Color="#FFB0B0B0" />
-            <SolidColorBrush x:Key="AccentBrush" Color="#FF60CDFF" />
-            <SolidColorBrush x:Key="SeparatorBrush" Color="#18FFFFFF" />
-
-            <Style x:Key="HeaderIconButtonStyle" TargetType="Button">
-                <Setter Property="Width" Value="32" />
-                <Setter Property="Height" Value="32" />
-                <Setter Property="Padding" Value="0" />
-                <Setter Property="CornerRadius" Value="6" />
-                <Setter Property="Background" Value="Transparent" />
-                <Setter Property="BorderBrush" Value="Transparent" />
-                <Setter Property="BorderThickness" Value="0" />
-            </Style>
-
-            <Style x:Key="FlowButtonStyle" TargetType="Button">
-                <Setter Property="CornerRadius" Value="8" />
-                <Setter Property="Padding" Value="12,7" />
-                <Setter Property="Background" Value="#0AFFFFFF" />
-                <Setter Property="BorderBrush" Value="#12FFFFFF" />
-                <Setter Property="BorderThickness" Value="1" />
-                <Setter Property="HorizontalAlignment" Value="Stretch" />
-                <Setter Property="FontSize" Value="13" />
-            </Style>
         </Grid.Resources>
 
         <Border x:Name="PanelSurface"
-                Width="400"
-                Height="660"
                 Padding="0"
                 HorizontalAlignment="Stretch"
                 VerticalAlignment="Stretch"
@@ -46,116 +20,11 @@
                 BorderBrush="{StaticResource PanelBorderBrush}"
                 BorderThickness="1"
                 CornerRadius="12">
-            <Grid>
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="*" />
-                    <RowDefinition Height="Auto" />
-                </Grid.RowDefinitions>
-
-                <!-- Header -->
-                <Grid Grid.Row="0" Padding="16,14,16,10" ColumnSpacing="10">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="Auto" />
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="Auto" />
-                    </Grid.ColumnDefinitions>
-
-                    <Button x:Name="DismissButton"
-                            Grid.Column="0"
-                            Style="{StaticResource HeaderIconButtonStyle}"
-                            Click="DismissButton_Click">
-                        <FontIcon Glyph="&#xE72B;" FontSize="14" />
-                    </Button>
-
-                    <TextBlock Grid.Column="1"
-                               Text="音量合成器"
-                               FontSize="16"
-                               FontWeight="SemiBold"
-                               VerticalAlignment="Center" />
-
-                    <Button x:Name="RefreshButton"
-                            Grid.Column="2"
-                            Style="{StaticResource HeaderIconButtonStyle}"
-                            Click="RefreshButton_Click">
-                        <FontIcon Glyph="&#xE72C;" FontSize="13" />
-                    </Button>
-                </Grid>
-
-                <!-- Output/Input toggle -->
-                <Grid Grid.Row="1" Padding="16,0,16,10" ColumnSpacing="8">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="*" />
-                    </Grid.ColumnDefinitions>
-
-                    <Button x:Name="OutputButton"
-                            Grid.Column="0"
-                            Style="{StaticResource FlowButtonStyle}"
-                            Click="OutputButton_Click"
-                            Content="输出" />
-                    <Button x:Name="InputButton"
-                            Grid.Column="1"
-                            Style="{StaticResource FlowButtonStyle}"
-                            Click="InputButton_Click"
-                            Content="输入" />
-                </Grid>
-
-                <!-- Default device summary -->
-                <Border Grid.Row="2"
-                        Margin="16,0,16,8"
-                        Padding="12,10"
-                        Background="#0AFFFFFF"
-                        CornerRadius="8"
-                        BorderBrush="#0CFFFFFF"
-                        BorderThickness="1">
-                    <Grid ColumnSpacing="10">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto" />
-                            <ColumnDefinition Width="*" />
-                        </Grid.ColumnDefinitions>
-
-                        <FontIcon Glyph="&#xE7F5;"
-                                  FontSize="16"
-                                  Foreground="{StaticResource AccentBrush}"
-                                  VerticalAlignment="Center" />
-
-                        <StackPanel Grid.Column="1" Spacing="2" VerticalAlignment="Center">
-                            <TextBlock x:Name="SummaryTextBlock"
-                                       FontSize="12"
-                                       FontWeight="SemiBold"
-                                       TextTrimming="CharacterEllipsis"
-                                       MaxLines="1" />
-                            <TextBlock x:Name="MetaTextBlock"
-                                       FontSize="11"
-                                       Foreground="{StaticResource PanelMutedBrush}"
-                                       TextTrimming="CharacterEllipsis"
-                                       MaxLines="1" />
-                        </StackPanel>
-                    </Grid>
-                </Border>
-
-                <!-- Session list -->
-                <ScrollViewer Grid.Row="3"
-                              Margin="8,0"
-                              VerticalScrollBarVisibility="Auto"
-                              HorizontalScrollBarVisibility="Disabled">
+            <ScrollViewer Margin="8"
+                          VerticalScrollBarVisibility="Visible"
+                          HorizontalScrollBarVisibility="Disabled">
                     <StackPanel x:Name="SessionHost" Spacing="2" Padding="0,4,0,4" />
-                </ScrollViewer>
-
-                <!-- Footer hint -->
-                <Border Grid.Row="4"
-                        Padding="16,8"
-                        BorderBrush="{StaticResource SeparatorBrush}"
-                        BorderThickness="0,1,0,0">
-                    <TextBlock Text="按 Esc 隐藏 · 左键点击托盘重新打开"
-                               Foreground="#FF666666"
-                               FontSize="11"
-                               HorizontalAlignment="Center" />
-                </Border>
-            </Grid>
+            </ScrollViewer>
         </Border>
     </Grid>
 </Window>

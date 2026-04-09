@@ -11,25 +11,31 @@ namespace AudioRoute;
 public sealed partial class SessionCardControl : UserControl
 {
     private readonly DispatcherQueueTimer volumeCommitTimer;
-    private MixerSessionInfo session;
+    private MixerAppSessionInfo appSession;
+    private IReadOnlyList<AudioDevice> devices;
+    private EDataFlow volumeFlow;
     private bool updatingUi;
     private bool isVolumeInteracting;
-    private bool isComboInteracting;
+    private bool isRoutePickerInteracting;
     private bool isInteracting;
     private bool hasPendingVolumeCommit;
     private float lastCommittedVolume;
     private bool isMuted;
+    private string? loadedIconPath;
+    private int iconLoadVersion;
 
-    public SessionCardControl(MixerSessionInfo session, IReadOnlyList<AudioDevice> devices)
+    public SessionCardControl(MixerAppSessionInfo appSession, IReadOnlyList<AudioDevice> devices)
     {
-        this.session = session;
+        this.appSession = appSession;
+        this.devices = devices;
+        volumeFlow = appSession.GetAvailableFlow(EDataFlow.eRender);
         InitializeComponent();
 
         volumeCommitTimer = DispatcherQueue.GetForCurrentThread().CreateTimer();
         volumeCommitTimer.Interval = TimeSpan.FromMilliseconds(160);
         volumeCommitTimer.Tick += VolumeCommitTimer_Tick;
 
-        ApplySession(devices);
+        ApplySession();
     }
 
     public event EventHandler<MixerDeviceChangedEventArgs>? DeviceChanged;
@@ -38,45 +44,72 @@ public sealed partial class SessionCardControl : UserControl
 
     public event EventHandler<MixerInteractionStateChangedEventArgs>? InteractionStateChanged;
 
-    public void UpdateSession(MixerSessionInfo updatedSession, IReadOnlyList<AudioDevice> devices)
+    public void UpdateSession(MixerAppSessionInfo updatedSession, IReadOnlyList<AudioDevice> updatedDevices)
     {
-        session = updatedSession;
-        ApplySession(devices);
+        appSession = updatedSession;
+        devices = updatedDevices;
+        volumeFlow = appSession.GetAvailableFlow(volumeFlow);
+        ApplySession();
     }
 
-    private void ApplySession(IReadOnlyList<AudioDevice> devices)
+    private MixerSessionInfo? VolumeSession => appSession.GetSession(volumeFlow);
+
+    private void ApplySession()
     {
-        TitleTextBlock.Text = session.DisplayName;
-        ProcessTextBlock.Text = session.IsSystemSession
+        TitleTextBlock.Text = appSession.DisplayName;
+        ProcessTextBlock.Text = appSession.IsSystemSession
             ? "系统音频会话"
-            : $"{session.ProcessName} | PID {session.ProcessId}";
-        SessionIcon.Glyph = session.IsSystemSession ? "\uE7F5" : "\uE77B";
+            : $"{appSession.ProcessName} | PID {appSession.ProcessId}";
+        SessionFallbackIcon.Glyph = appSession.IsSystemSession ? "\uE7F5" : "\uE77B";
 
-        ToolTipService.SetToolTip(TitleTextBlock, session.DisplayName);
+        ToolTipService.SetToolTip(TitleTextBlock, appSession.DisplayName);
 
-        // Device info - compact single line
-        var deviceInfo = session.CanChangeDevice
-            ? session.BoundDeviceSummary
-            : session.ActualDeviceSummary;
-        DeviceInfoTextBlock.Text = deviceInfo;
-        ToolTipService.SetToolTip(DeviceInfoTextBlock, $"当前: {session.ActualDeviceSummary}\n目标: {(session.CanChangeDevice ? session.BoundDeviceSummary : "不适用")}");
+        UpdateRoutePicker(OutputRouteButton, OutputRouteTextBlock, appSession.OutputSession, EDataFlow.eRender);
+        UpdateRoutePicker(InputRouteButton, InputRouteTextBlock, appSession.InputSession, EDataFlow.eCapture);
+        ApplyVolumeSession();
+        _ = UpdateSessionIconAsync();
+    }
 
-        // Device panel visibility
-        DevicePanel.Visibility = session.CanChangeDevice ? Visibility.Visible : Visibility.Collapsed;
+    private void UpdateRoutePicker(Button button, TextBlock textBlock, MixerSessionInfo? session, EDataFlow flow)
+    {
+        var label = GetFlowLabel(flow);
+        var summary = session switch
+        {
+            null => label,
+            _ when session.CanChangeDevice => $"{label} · {session.BoundDeviceSummary}",
+            _ => $"{label} · {session.ActualDeviceSummary}"
+        };
 
-        DeviceComboBox.IsEnabled = session.CanChangeDevice;
-        PopulateDeviceChoices(devices);
+        button.IsEnabled = session?.CanChangeDevice == true;
+        button.Opacity = session is null ? 0.45d : 1d;
+        textBlock.Text = summary;
+        textBlock.Opacity = button.IsEnabled ? 1d : 0.58d;
+        ToolTipService.SetToolTip(button, summary);
+    }
 
-        // Mute state
-        isMuted = session.IsMuted;
+    private void ApplyVolumeSession()
+    {
+        var volumeSession = VolumeSession;
+        if (volumeSession is null)
+        {
+            VolumeSlider.IsEnabled = false;
+            MuteButton.IsEnabled = false;
+            ToolTipService.SetToolTip(VolumeSlider, null);
+            return;
+        }
+
+        isMuted = volumeSession.IsMuted;
+        VolumeSlider.IsEnabled = true;
+        MuteButton.IsEnabled = true;
         UpdateMuteIcon();
 
         if (!isVolumeInteracting)
         {
             updatingUi = true;
-            VolumeSlider.Value = Math.Clamp((int)Math.Round(session.Volume * 100), 0, 100);
+            VolumeSlider.Value = Math.Clamp((int)Math.Round(volumeSession.Volume * 100), 0, 100);
             updatingUi = false;
             lastCommittedVolume = (float)(VolumeSlider.Value / 100d);
+            hasPendingVolumeCommit = false;
         }
 
         UpdateVolumeText();
@@ -86,25 +119,25 @@ public sealed partial class SessionCardControl : UserControl
     {
         if (isMuted || VolumeSlider.Value == 0)
         {
-            MuteIcon.Glyph = "\uE74F"; // Muted
+            MuteIcon.Glyph = "\uE74F";
             MuteIcon.Foreground = new Microsoft.UI.Xaml.Media.SolidColorBrush(
                 Windows.UI.Color.FromArgb(255, 150, 150, 150));
         }
         else if (VolumeSlider.Value < 34)
         {
-            MuteIcon.Glyph = "\uE993"; // Low volume
+            MuteIcon.Glyph = "\uE993";
             MuteIcon.Foreground = new Microsoft.UI.Xaml.Media.SolidColorBrush(
                 Windows.UI.Color.FromArgb(255, 255, 255, 255));
         }
         else if (VolumeSlider.Value < 67)
         {
-            MuteIcon.Glyph = "\uE994"; // Medium volume
+            MuteIcon.Glyph = "\uE994";
             MuteIcon.Foreground = new Microsoft.UI.Xaml.Media.SolidColorBrush(
                 Windows.UI.Color.FromArgb(255, 255, 255, 255));
         }
         else
         {
-            MuteIcon.Glyph = "\uE767"; // Full volume
+            MuteIcon.Glyph = "\uE767";
             MuteIcon.Foreground = new Microsoft.UI.Xaml.Media.SolidColorBrush(
                 Windows.UI.Color.FromArgb(255, 255, 255, 255));
         }
@@ -112,18 +145,17 @@ public sealed partial class SessionCardControl : UserControl
 
     private void MuteButton_Click(object sender, RoutedEventArgs e)
     {
+        if (VolumeSession is null)
+            return;
+
         if (isMuted)
         {
-            // Unmute: restore volume to previous value or 100%
             isMuted = false;
             if (VolumeSlider.Value == 0)
-            {
                 VolumeSlider.Value = 100;
-            }
         }
         else
         {
-            // Mute: set volume to 0
             isMuted = true;
             updatingUi = true;
             VolumeSlider.Value = 0;
@@ -131,68 +163,78 @@ public sealed partial class SessionCardControl : UserControl
             hasPendingVolumeCommit = true;
             CommitVolumeChange();
         }
+
         UpdateMuteIcon();
     }
 
-    private void PopulateDeviceChoices(IReadOnlyList<AudioDevice> devices)
+    private void OutputRouteButton_Click(object sender, RoutedEventArgs e)
     {
-        updatingUi = true;
-        try
-        {
-            DeviceComboBox.Items.Clear();
-
-            if (session.CanChangeDevice)
-            {
-                DeviceComboBox.Items.Add(new DeviceChoice(null, "跟随系统默认"));
-
-                foreach (var device in devices.Where(device => device.Flow == session.Flow))
-                {
-                    var title = device.IsDefault ? $"{device.Name} [默认]" : device.Name;
-                    DeviceComboBox.Items.Add(new DeviceChoice(device.Id, title));
-                }
-
-                if (!string.IsNullOrWhiteSpace(session.BoundDeviceId) &&
-                    DeviceComboBox.Items.OfType<DeviceChoice>().All(item => !string.Equals(item.DeviceId, session.BoundDeviceId, StringComparison.OrdinalIgnoreCase)))
-                {
-                    DeviceComboBox.Items.Add(new DeviceChoice(session.BoundDeviceId, session.BoundDeviceSummary));
-                }
-
-                var selected = DeviceComboBox.Items
-                    .OfType<DeviceChoice>()
-                    .FirstOrDefault(item => string.Equals(item.DeviceId, session.BoundDeviceId, StringComparison.OrdinalIgnoreCase))
-                    ?? DeviceComboBox.Items.OfType<DeviceChoice>().FirstOrDefault(item => item.DeviceId == null);
-
-                DeviceComboBox.SelectedItem = selected;
-            }
-            else
-            {
-                DeviceComboBox.Items.Add(new DeviceChoice(null, "系统会话"));
-                DeviceComboBox.SelectedIndex = 0;
-            }
-        }
-        finally
-        {
-            updatingUi = false;
-        }
+        ShowRoutePicker(OutputRouteButton, appSession.OutputSession, EDataFlow.eRender);
     }
 
-    private void DeviceComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    private void InputRouteButton_Click(object sender, RoutedEventArgs e)
     {
-        if (updatingUi || DeviceComboBox.SelectedItem is not DeviceChoice choice)
+        ShowRoutePicker(InputRouteButton, appSession.InputSession, EDataFlow.eCapture);
+    }
+
+    private void ShowRoutePicker(FrameworkElement anchor, MixerSessionInfo? session, EDataFlow flow)
+    {
+        if (session is null || !session.CanChangeDevice)
             return;
 
-        DeviceChanged?.Invoke(this, new MixerDeviceChangedEventArgs(session, choice.DeviceId));
+        var flyout = BuildRouteFlyout(session, flow);
+        flyout.Opened += RouteFlyout_Opened;
+        flyout.Closed += RouteFlyout_Closed;
+        flyout.ShowAt(anchor);
     }
 
-    private void DeviceComboBox_DropDownOpened(object sender, object e)
+    private MenuFlyout BuildRouteFlyout(MixerSessionInfo session, EDataFlow flow)
     {
-        isComboInteracting = true;
+        var flyout = new MenuFlyout();
+        flyout.Items.Add(CreateRouteMenuItem(session, null, "跟随系统默认", string.IsNullOrWhiteSpace(session.BoundDeviceId)));
+
+        foreach (var device in devices.Where(device => device.Flow == flow))
+        {
+            flyout.Items.Add(CreateRouteMenuItem(
+                session,
+                device.Id,
+                device.Name,
+                string.Equals(device.Id, session.BoundDeviceId, StringComparison.OrdinalIgnoreCase)));
+        }
+
+        if (!string.IsNullOrWhiteSpace(session.BoundDeviceId) &&
+            devices.Where(device => device.Flow == flow)
+                .All(device => !string.Equals(device.Id, session.BoundDeviceId, StringComparison.OrdinalIgnoreCase)))
+        {
+            flyout.Items.Add(CreateRouteMenuItem(session, session.BoundDeviceId, session.BoundDeviceSummary, true));
+        }
+
+        return flyout;
+    }
+
+    private MenuFlyoutItem CreateRouteMenuItem(MixerSessionInfo session, string? deviceId, string title, bool selected)
+    {
+        var item = new MenuFlyoutItem
+        {
+            Text = title
+        };
+
+        if (selected)
+            item.Icon = new FontIcon { Glyph = "\uE73E" };
+
+        item.Click += (_, _) => DeviceChanged?.Invoke(this, new MixerDeviceChangedEventArgs(session, deviceId));
+        return item;
+    }
+
+    private void RouteFlyout_Opened(object sender, object e)
+    {
+        isRoutePickerInteracting = true;
         UpdateInteractionState();
     }
 
-    private void DeviceComboBox_DropDownClosed(object sender, object e)
+    private void RouteFlyout_Closed(object sender, object e)
     {
-        isComboInteracting = false;
+        isRoutePickerInteracting = false;
         UpdateInteractionState();
     }
 
@@ -221,7 +263,7 @@ public sealed partial class SessionCardControl : UserControl
         UpdateVolumeText();
         UpdateMuteIcon();
 
-        if (updatingUi)
+        if (updatingUi || VolumeSession is null)
             return;
 
         hasPendingVolumeCommit = true;
@@ -232,7 +274,59 @@ public sealed partial class SessionCardControl : UserControl
     private void UpdateVolumeText()
     {
         var value = Math.Clamp((int)Math.Round(VolumeSlider.Value), 0, 100);
-        VolumeValueTextBlock.Text = $"{value}%";
+        ToolTipService.SetToolTip(VolumeSlider, $"{value}%");
+    }
+
+    private async System.Threading.Tasks.Task UpdateSessionIconAsync()
+    {
+        var executablePath = appSession.ExecutablePath;
+        var requestVersion = ++iconLoadVersion;
+
+        if (appSession.IsSystemSession || string.IsNullOrWhiteSpace(executablePath))
+        {
+            loadedIconPath = null;
+            ShowFallbackIcon(appSession.IsSystemSession, clearImageSource: true);
+            return;
+        }
+
+        if (string.Equals(loadedIconPath, executablePath, StringComparison.OrdinalIgnoreCase) &&
+            SessionIconImage.Source is not null)
+        {
+            ShowLoadedIcon();
+            return;
+        }
+
+        ShowFallbackIcon(appSession.IsSystemSession, clearImageSource: true);
+
+        var iconSource = await AppIconService.TryLoadIconAsync(executablePath);
+        if (requestVersion != iconLoadVersion)
+            return;
+
+        if (iconSource is null)
+        {
+            loadedIconPath = null;
+            ShowFallbackIcon(appSession.IsSystemSession, clearImageSource: true);
+            return;
+        }
+
+        loadedIconPath = executablePath;
+        SessionIconImage.Source = iconSource;
+        ShowLoadedIcon();
+    }
+
+    private void ShowFallbackIcon(bool isSystemSession, bool clearImageSource)
+    {
+        SessionFallbackIcon.Glyph = isSystemSession ? "\uE7F5" : "\uE77B";
+        SessionFallbackIcon.Visibility = Visibility.Visible;
+        SessionIconImage.Visibility = Visibility.Collapsed;
+        if (clearImageSource)
+            SessionIconImage.Source = null;
+    }
+
+    private void ShowLoadedIcon()
+    {
+        SessionFallbackIcon.Visibility = Visibility.Collapsed;
+        SessionIconImage.Visibility = Visibility.Visible;
     }
 
     private void VolumeCommitTimer_Tick(object? sender, object e)
@@ -247,6 +341,13 @@ public sealed partial class SessionCardControl : UserControl
         if (!hasPendingVolumeCommit)
             return;
 
+        var volumeSession = VolumeSession;
+        if (volumeSession is null)
+        {
+            hasPendingVolumeCommit = false;
+            return;
+        }
+
         var volume = (float)(VolumeSlider.Value / 100d);
         if (Math.Abs(volume - lastCommittedVolume) < 0.005f)
         {
@@ -256,31 +357,21 @@ public sealed partial class SessionCardControl : UserControl
 
         hasPendingVolumeCommit = false;
         lastCommittedVolume = volume;
-        VolumeChanged?.Invoke(this, new MixerVolumeChangedEventArgs(session, volume));
+        VolumeChanged?.Invoke(this, new MixerVolumeChangedEventArgs(volumeSession, volume));
     }
 
     private void UpdateInteractionState()
     {
-        var nextState = isVolumeInteracting || isComboInteracting;
+        var nextState = isVolumeInteracting || isRoutePickerInteracting;
         if (nextState == isInteracting)
             return;
 
         isInteracting = nextState;
-        InteractionStateChanged?.Invoke(this, new MixerInteractionStateChangedEventArgs(session, isInteracting));
+        InteractionStateChanged?.Invoke(this, new MixerInteractionStateChangedEventArgs(VolumeSession ?? appSession.PrimarySession, isInteracting));
     }
 
-    private sealed class DeviceChoice
+    private static string GetFlowLabel(EDataFlow flow)
     {
-        public DeviceChoice(string? deviceId, string title)
-        {
-            DeviceId = deviceId;
-            Title = title;
-        }
-
-        public string? DeviceId { get; }
-
-        public string Title { get; }
-
-        public override string ToString() => Title;
+        return flow == EDataFlow.eRender ? "输出" : "输入";
     }
 }

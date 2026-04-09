@@ -19,6 +19,49 @@ public sealed class MixerSessionInfo
     public bool CanChangeDevice => ProcessId > 0;
 }
 
+public sealed class MixerAppSessionInfo
+{
+    public required string SessionKey { get; init; }
+    public required MixerSessionInfo PrimarySession { get; init; }
+    public MixerSessionInfo? OutputSession { get; init; }
+    public MixerSessionInfo? InputSession { get; init; }
+
+    public string DisplayName => PrimarySession.DisplayName;
+
+    public string ProcessName => PrimarySession.ProcessName;
+
+    public string? ExecutablePath => PrimarySession.ExecutablePath;
+
+    public int ProcessId => PrimarySession.ProcessId;
+
+    public bool IsSystemSession => PrimarySession.IsSystemSession;
+
+    public bool HasOutput => OutputSession is not null;
+
+    public bool HasInput => InputSession is not null;
+
+    public MixerSessionInfo? GetSession(EDataFlow flow)
+    {
+        return flow switch
+        {
+            EDataFlow.eRender => OutputSession,
+            EDataFlow.eCapture => InputSession,
+            _ => null
+        };
+    }
+
+    public EDataFlow GetAvailableFlow(EDataFlow preferredFlow)
+    {
+        if (preferredFlow == EDataFlow.eRender && HasOutput)
+            return EDataFlow.eRender;
+
+        if (preferredFlow == EDataFlow.eCapture && HasInput)
+            return EDataFlow.eCapture;
+
+        return HasOutput ? EDataFlow.eRender : EDataFlow.eCapture;
+    }
+}
+
 public sealed class MixerDeviceChangedEventArgs : EventArgs
 {
     public MixerDeviceChangedEventArgs(MixerSessionInfo session, string? deviceId)
