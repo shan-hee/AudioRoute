@@ -3,9 +3,12 @@
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     Title="AudioRoute">
+    <Window.SystemBackdrop>
+        <DesktopAcrylicBackdrop />
+    </Window.SystemBackdrop>
     <Grid x:Name="WindowRoot" Background="Transparent" RequestedTheme="Dark">
         <Grid.Resources>
-            <SolidColorBrush x:Key="PanelBackgroundBrush" Color="#FF2C2C2C" />
+            <SolidColorBrush x:Key="PanelBackgroundBrush" Color="Transparent" />
             <SolidColorBrush x:Key="PanelBorderBrush" Color="#FF383838" />
             <SolidColorBrush x:Key="PanelRaisedBrush" Color="#FF333333" />
             <SolidColorBrush x:Key="PanelMutedBrush" Color="#FFB0B0B0" />
