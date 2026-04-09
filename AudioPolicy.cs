@@ -1,4 +1,6 @@
 ﻿using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.InteropServices;
 
 namespace AudioRoute;
@@ -30,6 +32,8 @@ public static class AudioPolicyManager
     private const uint CoinitApartmentThreaded = 0x2;
 
     private static readonly object SyncRoot = new();
+    private static readonly Dictionary<PolicyCacheKey, CachedPolicyValue> DefaultDeviceCache = new();
+    private static readonly TimeSpan DefaultDeviceCacheDuration = TimeSpan.FromSeconds(3);
 
     private static bool s_comInitialized;
     private static IntPtr s_factory;
@@ -55,15 +59,32 @@ public static class AudioPolicyManager
     public static string? GetAppDefaultDevice(uint processId, EDataFlow flow = EDataFlow.eRender, ERole role = ERole.eMultimedia)
     {
         EnsureFlowSupported(flow);
+        var cacheKey = new PolicyCacheKey(processId, flow, role);
+        var now = DateTimeOffset.UtcNow;
+
+        lock (SyncRoot)
+        {
+            if (DefaultDeviceCache.TryGetValue(cacheKey, out var cachedValue) &&
+                cachedValue.ExpiresAt > now)
+            {
+                return cachedValue.DeviceId;
+            }
+        }
+
         EnsureFactory();
 
         foreach (var currentRole in ExpandRoles(role))
         {
             var packedDeviceId = GetPackedDeviceId(processId, flow, currentRole);
             if (!string.IsNullOrWhiteSpace(packedDeviceId))
-                return UnpackDeviceId(packedDeviceId, flow);
+            {
+                var deviceId = UnpackDeviceId(packedDeviceId, flow);
+                StoreDefaultDeviceCache(cacheKey, deviceId, now);
+                return deviceId;
+            }
         }
 
+        StoreDefaultDeviceCache(cacheKey, null, now);
         return null;
     }
 
@@ -78,6 +99,8 @@ public static class AudioPolicyManager
         var packedDeviceId = PackDeviceId(deviceId, flow);
         foreach (var currentRole in ExpandRoles(role))
             SetPackedDeviceId(processId, flow, currentRole, packedDeviceId);
+
+        InvalidateDefaultDeviceCache(processId, flow);
     }
 
     public static void ClearAppDefaultDevice(uint processId, EDataFlow flow = EDataFlow.eRender, ERole role = ERole.eMultimedia)
@@ -87,6 +110,8 @@ public static class AudioPolicyManager
 
         foreach (var currentRole in ExpandRoles(role))
             ClearPackedDeviceId(processId, flow, currentRole);
+
+        InvalidateDefaultDeviceCache(processId, flow);
     }
 
     public static void Cleanup()
@@ -101,6 +126,7 @@ public static class AudioPolicyManager
 
             s_getPersistedDefaultAudioEndpoint = null;
             s_setPersistedDefaultAudioEndpoint = null;
+            DefaultDeviceCache.Clear();
 
             if (s_comInitialized)
             {
@@ -233,6 +259,45 @@ public static class AudioPolicyManager
         return packedDeviceId.Substring(prefix.Length, payloadLength);
     }
 
+    private static void StoreDefaultDeviceCache(PolicyCacheKey cacheKey, string? deviceId, DateTimeOffset now)
+    {
+        lock (SyncRoot)
+        {
+            DefaultDeviceCache[cacheKey] = new CachedPolicyValue(deviceId, now + DefaultDeviceCacheDuration);
+
+            if (DefaultDeviceCache.Count <= 256)
+                return;
+
+            var expiredKeys = DefaultDeviceCache
+                .Where(pair => pair.Value.ExpiresAt <= now)
+                .Select(pair => pair.Key)
+                .ToArray();
+
+            foreach (var key in expiredKeys)
+                DefaultDeviceCache.Remove(key);
+
+            if (DefaultDeviceCache.Count <= 256)
+                return;
+
+            using var enumerator = DefaultDeviceCache.Keys.GetEnumerator();
+            if (enumerator.MoveNext())
+                DefaultDeviceCache.Remove(enumerator.Current);
+        }
+    }
+
+    private static void InvalidateDefaultDeviceCache(uint processId, EDataFlow flow)
+    {
+        lock (SyncRoot)
+        {
+            var keysToRemove = DefaultDeviceCache.Keys
+                .Where(key => key.ProcessId == processId && key.Flow == flow)
+                .ToArray();
+
+            foreach (var key in keysToRemove)
+                DefaultDeviceCache.Remove(key);
+        }
+    }
+
     private static Guid ResolveActivationFactoryClassId()
     {
         var buildNumber = GetWindowsBuildNumber();
@@ -338,4 +403,8 @@ public static class AudioPolicyManager
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
         public string CsdVersion;
     }
+
+    private readonly record struct PolicyCacheKey(uint ProcessId, EDataFlow Flow, ERole Role);
+
+    private sealed record CachedPolicyValue(string? DeviceId, DateTimeOffset ExpiresAt);
 }

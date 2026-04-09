@@ -57,10 +57,11 @@ public static class AudioSessionService
     public static void SetSessionVolume(string sessionKey, EDataFlow flow, float volume)
     {
         var clampedVolume = Math.Clamp(volume, 0f, 1f);
-        UpdateMatchingSessions(sessionKey, flow, session => session.SimpleAudioVolume.Volume = clampedVolume);
+        var sessionMatcher = SessionMatcher.Create(sessionKey);
+        UpdateMatchingSessions(sessionMatcher, flow, session => session.SimpleAudioVolume.Volume = clampedVolume);
     }
 
-    private static void UpdateMatchingSessions(string sessionKey, EDataFlow flow, Action<AudioSessionControl> update)
+    private static void UpdateMatchingSessions(SessionMatcher sessionMatcher, EDataFlow flow, Action<AudioSessionControl> update)
     {
         using var enumerator = new MMDeviceEnumerator();
         var audioDevices = enumerator.EnumerateAudioEndPoints(ToNaudioFlow(flow), NAudioDeviceState.Active);
@@ -73,8 +74,7 @@ public static class AudioSessionService
             for (var sessionIndex = 0; sessionIndex < sessions.Count; sessionIndex++)
             {
                 using var session = sessions[sessionIndex];
-                var processId = checked((int)session.GetProcessID);
-                if (!string.Equals(BuildSessionKey(session, processId), sessionKey, StringComparison.OrdinalIgnoreCase))
+                if (!sessionMatcher.IsMatch(session))
                     continue;
 
                 update(session);
@@ -364,4 +364,33 @@ public static class AudioSessionService
         string? MainWindowTitle);
 
     private sealed record CachedProcessMetadata(ProcessMetadata Metadata, DateTimeOffset ExpiresAt);
+
+    private readonly record struct SessionMatcher(bool IsSystemSession, int ProcessId)
+    {
+        public static SessionMatcher Create(string sessionKey)
+        {
+            if (string.Equals(sessionKey, "system", StringComparison.OrdinalIgnoreCase))
+                return new SessionMatcher(true, 0);
+
+            if (sessionKey.StartsWith("pid:", StringComparison.OrdinalIgnoreCase))
+            {
+                if (int.TryParse(sessionKey.AsSpan(4), out var processId))
+                    return new SessionMatcher(false, processId);
+            }
+
+            return new SessionMatcher(false, int.MinValue);
+        }
+
+        public bool IsMatch(AudioSessionControl session)
+        {
+            if (IsSystemSession)
+                return session.IsSystemSoundsSession;
+
+            if (ProcessId <= 0)
+                return false;
+
+            return !session.IsSystemSoundsSession &&
+                checked((int)session.GetProcessID) == ProcessId;
+        }
+    }
 }

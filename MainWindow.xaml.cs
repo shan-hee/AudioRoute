@@ -23,6 +23,7 @@ public sealed partial class MainWindow : Window
     private static readonly TimeSpan DeactivateHideDelay = TimeSpan.FromMilliseconds(140);
     private static readonly TimeSpan ForegroundMonitorInterval = TimeSpan.FromMilliseconds(220);
     private static readonly TimeSpan HideSuppressionDuration = TimeSpan.FromMilliseconds(320);
+    private static readonly TimeSpan TrayReopenSuppressionDuration = TimeSpan.FromMilliseconds(300);
     private static readonly TimeSpan TrayIconRefreshInterval = TimeSpan.FromMilliseconds(500);
     private const uint TrayIconId = 1;
     private const uint TrayCallbackMessage = NativeMethods.WmApp + 1;
@@ -47,6 +48,7 @@ public sealed partial class MainWindow : Window
     private bool hasDeferredRefresh;
     private bool isTrayIconCreated;
     private DateTimeOffset lastPrimaryTrayInvokeAt;
+    private DateTimeOffset suppressPrimaryTrayInvokeUntil;
     private MasterVolumeState? lastTrayVolumeState;
     private DateTimeOffset suppressHideUntil;
     private int interactionDepth;
@@ -416,6 +418,7 @@ public sealed partial class MainWindow : Window
             NativeMethods.SetWindowCloaked(hwnd, true);
             NativeMethods.ShowWindow(hwnd, NativeMethods.SwHide);
             isPanelVisible = false;
+            suppressPrimaryTrayInvokeUntil = DateTimeOffset.UtcNow + TrayReopenSuppressionDuration;
         }
         finally
         {
@@ -703,6 +706,9 @@ public sealed partial class MainWindow : Window
 
         if (trayMessage == NativeMethods.NinSelect || trayMessage == NativeMethods.WmLButtonUp)
         {
+            if (!isPanelVisible && DateTimeOffset.UtcNow < suppressPrimaryTrayInvokeUntil)
+                return;
+
             if (DateTimeOffset.UtcNow - lastPrimaryTrayInvokeAt < TimeSpan.FromMilliseconds(200))
                 return;
 
@@ -786,6 +792,7 @@ public sealed partial class MainWindow : Window
                 IntPtr.Zero);
 
             _ = NativeMethods.PostMessage(hwnd, NativeMethods.WmNull, IntPtr.Zero, IntPtr.Zero);
+            RestoreTrayIconFocus();
         }
         finally
         {
@@ -823,11 +830,111 @@ public sealed partial class MainWindow : Window
         if (appWindow is null)
             return;
 
+        if (TryGetTrayAnchoredPanelPosition(out var panelPosition))
+        {
+            appWindow.Move(panelPosition);
+            return;
+        }
+
         var windowId = Microsoft.UI.Win32Interop.GetWindowIdFromWindow(hwnd);
         var displayArea = DisplayArea.GetFromWindowId(windowId, DisplayAreaFallback.Primary);
-        var x = displayArea.WorkArea.X + displayArea.WorkArea.Width - PanelWidth - ScreenMargin;
-        var y = displayArea.WorkArea.Y + displayArea.WorkArea.Height - PanelHeight - ScreenMargin;
+        var workArea = displayArea.WorkArea;
+        var x = workArea.X + workArea.Width - PanelWidth - ScreenMargin;
+        var y = workArea.Y + workArea.Height - PanelHeight - ScreenMargin;
         appWindow.Move(new PointInt32(x, y));
+    }
+
+    private bool TryGetTrayAnchoredPanelPosition(out PointInt32 panelPosition)
+    {
+        panelPosition = default;
+
+        if (!TryGetTrayIconRect(out var trayIconRect))
+            return false;
+
+        var trayCenter = new PointInt32(
+            trayIconRect.Left + ((trayIconRect.Right - trayIconRect.Left) / 2),
+            trayIconRect.Top + ((trayIconRect.Bottom - trayIconRect.Top) / 2));
+        var displayArea = DisplayArea.GetFromPoint(trayCenter, DisplayAreaFallback.Nearest);
+        if (displayArea is null)
+            return false;
+
+        panelPosition = CalculatePanelPosition(displayArea.WorkArea, trayIconRect);
+        return true;
+    }
+
+    private void RestoreTrayIconFocus()
+    {
+        if (!isTrayIconCreated)
+            return;
+
+        var notifyIconData = new NativeMethods.NotifyIconData
+        {
+            cbSize = (uint)Marshal.SizeOf<NativeMethods.NotifyIconData>(),
+            hWnd = hwnd,
+            uID = TrayIconId
+        };
+
+        _ = NativeMethods.ShellNotifyIcon(NativeMethods.NimSetFocus, ref notifyIconData);
+    }
+
+    private static PointInt32 CalculatePanelPosition(RectInt32 workArea, Rect trayIconRect)
+    {
+        var minX = workArea.X + ScreenMargin;
+        var minY = workArea.Y + ScreenMargin;
+        var maxX = Math.Max(minX, workArea.X + workArea.Width - PanelWidth - ScreenMargin);
+        var maxY = Math.Max(minY, workArea.Y + workArea.Height - PanelHeight - ScreenMargin);
+
+        return DetectTrayDockEdge(workArea, trayIconRect) switch
+        {
+            TrayDockEdge.Left => new PointInt32(minX, maxY),
+            TrayDockEdge.Top => new PointInt32(maxX, minY),
+            TrayDockEdge.Right => new PointInt32(maxX, maxY),
+            _ => new PointInt32(maxX, maxY)
+        };
+    }
+
+    private static TrayDockEdge DetectTrayDockEdge(RectInt32 workArea, Rect trayIconRect)
+    {
+        var workAreaLeft = workArea.X;
+        var workAreaTop = workArea.Y;
+        var workAreaRight = workArea.X + workArea.Width;
+        var workAreaBottom = workArea.Y + workArea.Height;
+
+        var leftOverflow = Math.Max(0, workAreaLeft - trayIconRect.Left);
+        var topOverflow = Math.Max(0, workAreaTop - trayIconRect.Top);
+        var rightOverflow = Math.Max(0, trayIconRect.Right - workAreaRight);
+        var bottomOverflow = Math.Max(0, trayIconRect.Bottom - workAreaBottom);
+
+        if (bottomOverflow > 0 || rightOverflow > 0 || leftOverflow > 0 || topOverflow > 0)
+        {
+            if (bottomOverflow >= rightOverflow && bottomOverflow >= leftOverflow && bottomOverflow >= topOverflow)
+                return TrayDockEdge.Bottom;
+
+            if (rightOverflow >= leftOverflow && rightOverflow >= topOverflow)
+                return TrayDockEdge.Right;
+
+            if (leftOverflow >= topOverflow)
+                return TrayDockEdge.Left;
+
+            return TrayDockEdge.Top;
+        }
+
+        var leftDistance = Math.Abs(trayIconRect.Left - workAreaLeft);
+        var topDistance = Math.Abs(trayIconRect.Top - workAreaTop);
+        var rightDistance = Math.Abs(workAreaRight - trayIconRect.Right);
+        var bottomDistance = Math.Abs(workAreaBottom - trayIconRect.Bottom);
+        var nearestDistance = Math.Min(Math.Min(leftDistance, rightDistance), Math.Min(topDistance, bottomDistance));
+
+        if (nearestDistance == bottomDistance)
+            return TrayDockEdge.Bottom;
+
+        if (nearestDistance == rightDistance)
+            return TrayDockEdge.Right;
+
+        if (nearestDistance == leftDistance)
+            return TrayDockEdge.Left;
+
+        return TrayDockEdge.Top;
     }
 
     private void ShowError(string message)
@@ -929,6 +1036,7 @@ public sealed partial class MainWindow : Window
         public const uint NimAdd = 0x00000000;
         public const uint NimModify = 0x00000001;
         public const uint NimDelete = 0x00000002;
+        public const uint NimSetFocus = 0x00000003;
         public const uint NimSetVersion = 0x00000004;
         public const uint NifMessage = 0x00000001;
         public const uint NifIcon = 0x00000002;
@@ -1127,6 +1235,14 @@ public sealed partial class MainWindow : Window
         public int Top;
         public int Right;
         public int Bottom;
+    }
+
+    private enum TrayDockEdge
+    {
+        Bottom,
+        Left,
+        Right,
+        Top
     }
 
     private delegate IntPtr WndProcDelegate(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
