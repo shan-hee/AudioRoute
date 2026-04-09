@@ -57,9 +57,6 @@ AudioRoute/
 └── MixerModels.cs               # 数据模型与事件定义
 ```
 
-### 核心原理
-
-AudioRoute 通过 P/Invoke 调用 Windows 未公开的 `AudioPolicyConfig` COM 接口（`Windows.Media.Internal.AudioPolicyConfig`），实现按进程 ID 设置默认音频终端设备。该接口同时支持 Windows 10 和 Windows 11 的不同版本。
 
 ## 依赖
 

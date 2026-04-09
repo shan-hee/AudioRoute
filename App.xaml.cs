@@ -13,7 +13,8 @@ public partial class App : Application
 
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
-        mainWindow = new MainWindow();
+        var showOnLaunch = !StartupManager.IsStartupLaunch(args.Arguments);
+        mainWindow = new MainWindow(showOnLaunch);
         mainWindow.Activate();
     }
 }

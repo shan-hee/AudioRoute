@@ -8,8 +8,8 @@
     </Window.SystemBackdrop>
     <Grid x:Name="WindowRoot" Background="Transparent" RequestedTheme="Dark">
         <Grid.Resources>
-            <SolidColorBrush x:Key="PanelBackgroundBrush" Color="Transparent" />
-            <SolidColorBrush x:Key="PanelBorderBrush" Color="#FF383838" />
+            <SolidColorBrush x:Key="PanelBackgroundBrush" Color="#F12B2B2B" />
+            <SolidColorBrush x:Key="PanelBorderBrush" Color="#1AFFFFFF" />
         </Grid.Resources>
 
         <Border x:Name="PanelSurface"
@@ -20,10 +20,10 @@
                 BorderBrush="{StaticResource PanelBorderBrush}"
                 BorderThickness="1"
                 CornerRadius="12">
-            <ScrollViewer Margin="8"
+            <ScrollViewer Margin="8,8,0,8"
                           VerticalScrollBarVisibility="Visible"
                           HorizontalScrollBarVisibility="Disabled">
-                    <StackPanel x:Name="SessionHost" Spacing="2" Padding="0,4,0,4" />
+                    <StackPanel x:Name="SessionHost" Spacing="2" Padding="0,4,8,4" />
             </ScrollViewer>
         </Border>
     </Grid>
