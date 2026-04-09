@@ -1,4 +1,4 @@
-# AudioRoute
+﻿# AudioRoute
 
 轻量级 Windows 音频路由工具，基于 WinUI 3 构建。以系统托盘面板的形式运行，提供按应用的音频设备路由和音量控制功能。
 

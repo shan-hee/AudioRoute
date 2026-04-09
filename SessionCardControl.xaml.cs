@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using Microsoft.UI.Dispatching;
@@ -226,13 +226,13 @@ public sealed partial class SessionCardControl : UserControl
         return item;
     }
 
-    private void RouteFlyout_Opened(object sender, object e)
+    private void RouteFlyout_Opened(object? sender, object e)
     {
         isRoutePickerInteracting = true;
         UpdateInteractionState();
     }
 
-    private void RouteFlyout_Closed(object sender, object e)
+    private void RouteFlyout_Closed(object? sender, object e)
     {
         isRoutePickerInteracting = false;
         UpdateInteractionState();

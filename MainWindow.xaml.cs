@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
@@ -612,7 +612,6 @@ public sealed partial class MainWindow : Window
         _ = NativeMethods.ShellNotifyIcon(NativeMethods.NimModify, ref notifyIconData);
     }
 
-#if false
     private static string BuildTrayToolTip(MasterVolumeState? volumeState)
     {
         if (volumeState is null)
@@ -621,18 +620,6 @@ public sealed partial class MainWindow : Window
         return volumeState.Value.IsMuted
             ? $"AudioRoute 主音量 {volumeState.Value.Percentage}% 已静音"
             : $"AudioRoute 主音量 {volumeState.Value.Percentage}%";
-    }
-
-#endif
-
-    private static string BuildTrayToolTip(MasterVolumeState? volumeState)
-    {
-        if (volumeState is null)
-            return "AudioRoute";
-
-        return volumeState.Value.IsMuted
-            ? $"AudioRoute \u4E3B\u97F3\u91CF {volumeState.Value.Percentage}% \u5DF2\u9759\u97F3"
-            : $"AudioRoute \u4E3B\u97F3\u91CF {volumeState.Value.Percentage}%";
     }
 
     private IntPtr WindowProc(IntPtr windowHandle, uint message, IntPtr wParam, IntPtr lParam)
@@ -764,14 +751,14 @@ public sealed partial class MainWindow : Window
                     return;
             }
 
-            _ = NativeMethods.AppendMenu(menuHandle, NativeMethods.MfString, HomeTrayMenuItemId, "\u4E3B\u9875");
+            _ = NativeMethods.AppendMenu(menuHandle, NativeMethods.MfString, HomeTrayMenuItemId, "主页");
             _ = NativeMethods.AppendMenu(
                 menuHandle,
                 NativeMethods.MfString | (StartupManager.IsEnabled() ? NativeMethods.MfChecked : 0),
                 StartupTrayMenuItemId,
-                "\u5F00\u673A\u81EA\u542F");
+                "开机自启");
             _ = NativeMethods.AppendMenu(menuHandle, NativeMethods.MfSeparator, 0, string.Empty);
-            _ = NativeMethods.AppendMenu(menuHandle, NativeMethods.MfString, ExitTrayMenuItemId, "\u9000\u51FA");
+            _ = NativeMethods.AppendMenu(menuHandle, NativeMethods.MfString, ExitTrayMenuItemId, "退出");
 
             NativeMethods.SetForegroundWindow(hwnd);
             _ = NativeMethods.TrackPopupMenu(
@@ -791,7 +778,6 @@ public sealed partial class MainWindow : Window
         }
     }
 
-#if false
     private void ToggleStartupRegistration()
     {
         try
@@ -802,21 +788,6 @@ public sealed partial class MainWindow : Window
         catch (Exception ex)
         {
             ShowError($"切换开机自启失败: {ex.Message}");
-        }
-    }
-
-#endif
-
-    private void ToggleStartupRegistration()
-    {
-        try
-        {
-            var enabled = StartupManager.IsEnabled();
-            StartupManager.SetEnabled(!enabled);
-        }
-        catch (Exception ex)
-        {
-            ShowError($"\u5207\u6362\u5F00\u673A\u81EA\u542F\u5931\u8D25: {ex.Message}");
         }
     }
 

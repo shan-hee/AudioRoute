@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using NAudio.CoreAudioApi;
 
 namespace AudioRoute;
