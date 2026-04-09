@@ -5,43 +5,45 @@
     Title="AudioRoute">
     <Grid x:Name="WindowRoot" Background="Transparent" RequestedTheme="Dark">
         <Grid.Resources>
-            <SolidColorBrush x:Key="PanelBackgroundBrush" Color="#FF202020" />
-            <SolidColorBrush x:Key="PanelBorderBrush" Color="#FF3A3A3A" />
-            <SolidColorBrush x:Key="PanelRaisedBrush" Color="#FF2A2A2A" />
-            <SolidColorBrush x:Key="PanelMutedBrush" Color="#FFBEBEBE" />
-            <SolidColorBrush x:Key="AccentBrush" Color="#FF3AA5FF" />
+            <SolidColorBrush x:Key="PanelBackgroundBrush" Color="#FF1C1C1C" />
+            <SolidColorBrush x:Key="PanelBorderBrush" Color="#FF333333" />
+            <SolidColorBrush x:Key="PanelRaisedBrush" Color="#FF282828" />
+            <SolidColorBrush x:Key="PanelMutedBrush" Color="#FFB0B0B0" />
+            <SolidColorBrush x:Key="AccentBrush" Color="#FF60CDFF" />
+            <SolidColorBrush x:Key="SeparatorBrush" Color="#18FFFFFF" />
 
             <Style x:Key="HeaderIconButtonStyle" TargetType="Button">
-                <Setter Property="Width" Value="34" />
-                <Setter Property="Height" Value="34" />
+                <Setter Property="Width" Value="32" />
+                <Setter Property="Height" Value="32" />
                 <Setter Property="Padding" Value="0" />
-                <Setter Property="CornerRadius" Value="17" />
-                <Setter Property="Background" Value="#1AFFFFFF" />
-                <Setter Property="BorderBrush" Value="#14FFFFFF" />
-                <Setter Property="BorderThickness" Value="1" />
+                <Setter Property="CornerRadius" Value="6" />
+                <Setter Property="Background" Value="Transparent" />
+                <Setter Property="BorderBrush" Value="Transparent" />
+                <Setter Property="BorderThickness" Value="0" />
             </Style>
 
             <Style x:Key="FlowButtonStyle" TargetType="Button">
-                <Setter Property="CornerRadius" Value="10" />
-                <Setter Property="Padding" Value="14,9" />
-                <Setter Property="Background" Value="#15000000" />
-                <Setter Property="BorderBrush" Value="#18FFFFFF" />
+                <Setter Property="CornerRadius" Value="8" />
+                <Setter Property="Padding" Value="12,7" />
+                <Setter Property="Background" Value="#0AFFFFFF" />
+                <Setter Property="BorderBrush" Value="#12FFFFFF" />
                 <Setter Property="BorderThickness" Value="1" />
                 <Setter Property="HorizontalAlignment" Value="Stretch" />
+                <Setter Property="FontSize" Value="13" />
             </Style>
         </Grid.Resources>
 
         <Border x:Name="PanelSurface"
-                Width="472"
-                Height="706"
-                Padding="16"
+                Width="400"
+                Height="660"
+                Padding="0"
                 HorizontalAlignment="Stretch"
                 VerticalAlignment="Stretch"
                 Background="{StaticResource PanelBackgroundBrush}"
                 BorderBrush="{StaticResource PanelBorderBrush}"
                 BorderThickness="1"
-                CornerRadius="20">
-            <Grid RowSpacing="14">
+                CornerRadius="12">
+            <Grid>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
@@ -50,7 +52,8 @@
                     <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
 
-                <Grid Grid.Row="0" ColumnSpacing="12">
+                <!-- Header -->
+                <Grid Grid.Row="0" Padding="16,14,16,10" ColumnSpacing="10">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="Auto" />
                         <ColumnDefinition Width="*" />
@@ -61,27 +64,25 @@
                             Grid.Column="0"
                             Style="{StaticResource HeaderIconButtonStyle}"
                             Click="DismissButton_Click">
-                        <SymbolIcon Symbol="Back" />
+                        <FontIcon Glyph="&#xE72B;" FontSize="14" />
                     </Button>
 
-                    <StackPanel Grid.Column="1" Spacing="3" VerticalAlignment="Center">
-                        <TextBlock Text="Audio mixer"
-                                   FontSize="21"
-                                   FontWeight="SemiBold" />
-                        <TextBlock Text="Quick routing and per-app audio control"
-                                   Foreground="{StaticResource PanelMutedBrush}"
-                                   FontSize="12" />
-                    </StackPanel>
+                    <TextBlock Grid.Column="1"
+                               Text="Audio Mixer"
+                               FontSize="16"
+                               FontWeight="SemiBold"
+                               VerticalAlignment="Center" />
 
                     <Button x:Name="RefreshButton"
                             Grid.Column="2"
                             Style="{StaticResource HeaderIconButtonStyle}"
                             Click="RefreshButton_Click">
-                        <FontIcon Glyph="&#xE72C;" />
+                        <FontIcon Glyph="&#xE72C;" FontSize="13" />
                     </Button>
                 </Grid>
 
-                <Grid Grid.Row="1" ColumnSpacing="10">
+                <!-- Output/Input toggle -->
+                <Grid Grid.Row="1" Padding="16,0,16,10" ColumnSpacing="8">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*" />
                         <ColumnDefinition Width="*" />
@@ -99,47 +100,57 @@
                             Content="Input" />
                 </Grid>
 
+                <!-- Default device summary -->
                 <Border Grid.Row="2"
-                        Padding="14,12"
-                        Background="#14000000"
-                        CornerRadius="14"
-                        BorderBrush="#12FFFFFF"
+                        Margin="16,0,16,8"
+                        Padding="12,10"
+                        Background="#0AFFFFFF"
+                        CornerRadius="8"
+                        BorderBrush="#0CFFFFFF"
                         BorderThickness="1">
-                    <StackPanel Spacing="5">
-                        <TextBlock Text="Overview"
-                                   FontSize="11"
-                                   FontWeight="SemiBold"
-                                   Foreground="{StaticResource PanelMutedBrush}" />
-                        <TextBlock x:Name="SummaryTextBlock"
-                                   FontSize="14"
-                                   FontWeight="SemiBold"
-                                   TextWrapping="WrapWholeWords" />
-                        <TextBlock x:Name="MetaTextBlock"
-                                   FontSize="12"
-                                   Foreground="{StaticResource PanelMutedBrush}"
-                                   TextWrapping="WrapWholeWords" />
-                    </StackPanel>
+                    <Grid ColumnSpacing="10">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+
+                        <FontIcon Glyph="&#xE7F5;"
+                                  FontSize="16"
+                                  Foreground="{StaticResource AccentBrush}"
+                                  VerticalAlignment="Center" />
+
+                        <StackPanel Grid.Column="1" Spacing="2" VerticalAlignment="Center">
+                            <TextBlock x:Name="SummaryTextBlock"
+                                       FontSize="12"
+                                       FontWeight="SemiBold"
+                                       TextTrimming="CharacterEllipsis"
+                                       MaxLines="1" />
+                            <TextBlock x:Name="MetaTextBlock"
+                                       FontSize="11"
+                                       Foreground="{StaticResource PanelMutedBrush}"
+                                       TextTrimming="CharacterEllipsis"
+                                       MaxLines="1" />
+                        </StackPanel>
+                    </Grid>
                 </Border>
 
-                <Border Grid.Row="3"
-                        Padding="6"
-                        Background="{StaticResource PanelRaisedBrush}"
-                        CornerRadius="16"
-                        BorderBrush="#12000000"
-                        BorderThickness="1">
-                    <ScrollViewer VerticalScrollBarVisibility="Auto"
-                                  HorizontalScrollBarVisibility="Disabled">
-                        <StackPanel x:Name="SessionHost" Spacing="10" Padding="2" />
-                    </ScrollViewer>
-                </Border>
+                <!-- Session list -->
+                <ScrollViewer Grid.Row="3"
+                              Margin="8,0"
+                              VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled">
+                    <StackPanel x:Name="SessionHost" Spacing="2" Padding="0,4,0,4" />
+                </ScrollViewer>
 
+                <!-- Footer hint -->
                 <Border Grid.Row="4"
-                        Padding="12,9"
-                        Background="#14000000"
-                        CornerRadius="12">
-                    <TextBlock Text="Press Esc or click outside the panel to hide it to tray. Left-click tray to open it, right-click for menu."
-                               Foreground="{StaticResource PanelMutedBrush}"
-                               FontSize="11" />
+                        Padding="16,8"
+                        BorderBrush="{StaticResource SeparatorBrush}"
+                        BorderThickness="0,1,0,0">
+                    <TextBlock Text="Esc to hide · Left-click tray to reopen"
+                               Foreground="#FF666666"
+                               FontSize="11"
+                               HorizontalAlignment="Center" />
                 </Border>
             </Grid>
         </Border>

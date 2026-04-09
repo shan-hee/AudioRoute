@@ -18,8 +18,8 @@ namespace AudioRoute;
 
 public sealed partial class MainWindow : Window
 {
-    private const int PanelWidth = 472;
-    private const int PanelHeight = 706;
+    private const int PanelWidth = 400;
+    private const int PanelHeight = 660;
     private const int ScreenMargin = 18;
     private const uint TrayIconId = 1;
     private const uint TrayCallbackMessage = NativeMethods.WmApp + 1;
@@ -238,27 +238,26 @@ public sealed partial class MainWindow : Window
     private static void ApplyFlowButton(Button button, bool selected)
     {
         button.Background = new Microsoft.UI.Xaml.Media.SolidColorBrush(
-            selected ? Windows.UI.Color.FromArgb(255, 49, 115, 194) : Windows.UI.Color.FromArgb(40, 255, 255, 255));
+            selected ? Windows.UI.Color.FromArgb(255, 56, 56, 56) : Windows.UI.Color.FromArgb(10, 255, 255, 255));
         button.BorderBrush = new Microsoft.UI.Xaml.Media.SolidColorBrush(
-            selected ? Windows.UI.Color.FromArgb(255, 78, 156, 255) : Windows.UI.Color.FromArgb(24, 255, 255, 255));
+            selected ? Windows.UI.Color.FromArgb(255, 96, 205, 255) : Windows.UI.Color.FromArgb(18, 255, 255, 255));
         button.Foreground = new Microsoft.UI.Xaml.Media.SolidColorBrush(
-            selected ? Windows.UI.Color.FromArgb(255, 255, 255, 255) : Windows.UI.Color.FromArgb(220, 230, 230, 230));
+            selected ? Windows.UI.Color.FromArgb(255, 96, 205, 255) : Windows.UI.Color.FromArgb(180, 200, 200, 200));
     }
 
     private FrameworkElement BuildPlaceholder(string message)
     {
         return new Border
         {
-            Padding = new Thickness(18),
-            CornerRadius = new CornerRadius(14),
-            Background = new Microsoft.UI.Xaml.Media.SolidColorBrush(Windows.UI.Color.FromArgb(255, 42, 42, 42)),
-            BorderBrush = new Microsoft.UI.Xaml.Media.SolidColorBrush(Windows.UI.Color.FromArgb(32, 255, 255, 255)),
-            BorderThickness = new Thickness(1),
+            Padding = new Thickness(16, 14, 16, 14),
+            CornerRadius = new CornerRadius(8),
+            Background = new Microsoft.UI.Xaml.Media.SolidColorBrush(Windows.UI.Color.FromArgb(10, 255, 255, 255)),
             Child = new TextBlock
             {
                 Text = message,
                 TextWrapping = TextWrapping.WrapWholeWords,
-                Foreground = new Microsoft.UI.Xaml.Media.SolidColorBrush(Windows.UI.Color.FromArgb(255, 200, 200, 200))
+                FontSize = 12,
+                Foreground = new Microsoft.UI.Xaml.Media.SolidColorBrush(Windows.UI.Color.FromArgb(255, 160, 160, 160))
             }
         };
     }

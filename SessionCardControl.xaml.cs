@@ -18,6 +18,7 @@ public sealed partial class SessionCardControl : UserControl
     private bool isInteracting;
     private bool hasPendingVolumeCommit;
     private float lastCommittedVolume;
+    private bool isMuted;
 
     public SessionCardControl(MixerSessionInfo session, IReadOnlyList<AudioDevice> devices)
     {
@@ -49,20 +50,26 @@ public sealed partial class SessionCardControl : UserControl
         ProcessTextBlock.Text = session.IsSystemSession
             ? "System audio session"
             : $"{session.ProcessName} | PID {session.ProcessId}";
-        ActualDeviceTextBlock.Text = session.ActualDeviceSummary;
-        BoundDeviceTextBlock.Text = session.CanChangeDevice
-            ? session.BoundDeviceSummary
-            : "System sessions cannot be rebound yet";
-        RouteLabelTextBlock.Text = session.Flow == EDataFlow.eRender ? "Output device" : "Input device";
-        VolumeLabelTextBlock.Text = session.Flow == EDataFlow.eRender ? "App volume" : "Input volume";
         SessionIcon.Glyph = session.IsSystemSession ? "\uE7F5" : "\uE77B";
 
         ToolTipService.SetToolTip(TitleTextBlock, session.DisplayName);
-        ToolTipService.SetToolTip(ActualDeviceTextBlock, session.ActualDeviceSummary);
-        ToolTipService.SetToolTip(BoundDeviceTextBlock, BoundDeviceTextBlock.Text);
+
+        // Device info - compact single line
+        var deviceInfo = session.CanChangeDevice
+            ? session.BoundDeviceSummary
+            : session.ActualDeviceSummary;
+        DeviceInfoTextBlock.Text = deviceInfo;
+        ToolTipService.SetToolTip(DeviceInfoTextBlock, $"Current: {session.ActualDeviceSummary}\nTarget: {(session.CanChangeDevice ? session.BoundDeviceSummary : "N/A")}");
+
+        // Device panel visibility
+        DevicePanel.Visibility = session.CanChangeDevice ? Visibility.Visible : Visibility.Collapsed;
 
         DeviceComboBox.IsEnabled = session.CanChangeDevice;
         PopulateDeviceChoices(devices);
+
+        // Mute state
+        isMuted = session.IsMuted;
+        UpdateMuteIcon();
 
         if (!isVolumeInteracting)
         {
@@ -73,6 +80,58 @@ public sealed partial class SessionCardControl : UserControl
         }
 
         UpdateVolumeText();
+    }
+
+    private void UpdateMuteIcon()
+    {
+        if (isMuted || VolumeSlider.Value == 0)
+        {
+            MuteIcon.Glyph = "\uE74F"; // Muted
+            MuteIcon.Foreground = new Microsoft.UI.Xaml.Media.SolidColorBrush(
+                Windows.UI.Color.FromArgb(255, 150, 150, 150));
+        }
+        else if (VolumeSlider.Value < 34)
+        {
+            MuteIcon.Glyph = "\uE993"; // Low volume
+            MuteIcon.Foreground = new Microsoft.UI.Xaml.Media.SolidColorBrush(
+                Windows.UI.Color.FromArgb(255, 255, 255, 255));
+        }
+        else if (VolumeSlider.Value < 67)
+        {
+            MuteIcon.Glyph = "\uE994"; // Medium volume
+            MuteIcon.Foreground = new Microsoft.UI.Xaml.Media.SolidColorBrush(
+                Windows.UI.Color.FromArgb(255, 255, 255, 255));
+        }
+        else
+        {
+            MuteIcon.Glyph = "\uE767"; // Full volume
+            MuteIcon.Foreground = new Microsoft.UI.Xaml.Media.SolidColorBrush(
+                Windows.UI.Color.FromArgb(255, 255, 255, 255));
+        }
+    }
+
+    private void MuteButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (isMuted)
+        {
+            // Unmute: restore volume to previous value or 100%
+            isMuted = false;
+            if (VolumeSlider.Value == 0)
+            {
+                VolumeSlider.Value = 100;
+            }
+        }
+        else
+        {
+            // Mute: set volume to 0
+            isMuted = true;
+            updatingUi = true;
+            VolumeSlider.Value = 0;
+            updatingUi = false;
+            hasPendingVolumeCommit = true;
+            CommitVolumeChange();
+        }
+        UpdateMuteIcon();
     }
 
     private void PopulateDeviceChoices(IReadOnlyList<AudioDevice> devices)
@@ -160,6 +219,7 @@ public sealed partial class SessionCardControl : UserControl
     private void VolumeSlider_ValueChanged(object sender, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e)
     {
         UpdateVolumeText();
+        UpdateMuteIcon();
 
         if (updatingUi)
             return;

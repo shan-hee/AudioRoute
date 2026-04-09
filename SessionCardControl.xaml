@@ -2,124 +2,128 @@
     x:Class="AudioRoute.SessionCardControl"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
-    <Border
-        Padding="12"
-        Background="#FF2A2A2A"
-        BorderBrush="#183F3F3F"
-        BorderThickness="1"
-        CornerRadius="14">
-        <StackPanel Spacing="10">
-            <Grid ColumnSpacing="12">
+    <Grid Padding="14,10,14,12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <!-- Row 0: App info header -->
+        <Grid Grid.Row="0" ColumnSpacing="10" Margin="0,0,0,6">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+
+            <Border Width="30"
+                    Height="30"
+                    CornerRadius="6"
+                    Background="#12FFFFFF"
+                    VerticalAlignment="Center">
+                <FontIcon x:Name="SessionIcon"
+                          FontSize="15"
+                          HorizontalAlignment="Center"
+                          VerticalAlignment="Center" />
+            </Border>
+
+            <StackPanel Grid.Column="1" Spacing="1" VerticalAlignment="Center">
+                <TextBlock x:Name="TitleTextBlock"
+                           FontSize="13"
+                           FontWeight="SemiBold"
+                           TextTrimming="CharacterEllipsis"
+                           MaxLines="1" />
+                <TextBlock x:Name="ProcessTextBlock"
+                           FontSize="11"
+                           Foreground="#FF9A9A9A"
+                           TextTrimming="CharacterEllipsis"
+                           MaxLines="1" />
+            </StackPanel>
+
+            <Border Grid.Column="2"
+                    Padding="7,2"
+                    Background="#143AA5FF"
+                    CornerRadius="4"
+                    VerticalAlignment="Center">
+                <TextBlock x:Name="VolumeValueTextBlock"
+                           Foreground="#FF8FD0FF"
+                           FontWeight="SemiBold"
+                           FontSize="11" />
+            </Border>
+        </Grid>
+
+        <!-- Row 1: Mute + Slider row (Win11 style) -->
+        <Grid Grid.Row="1" ColumnSpacing="8" Margin="0,0,0,8">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <Button x:Name="MuteButton"
+                    Width="30"
+                    Height="30"
+                    Padding="0"
+                    CornerRadius="6"
+                    Background="Transparent"
+                    BorderThickness="0"
+                    VerticalAlignment="Center"
+                    Click="MuteButton_Click">
+                <FontIcon x:Name="MuteIcon"
+                          FontSize="14"
+                          Glyph="&#xE767;" />
+            </Button>
+
+            <Slider x:Name="VolumeSlider"
+                    Grid.Column="1"
+                    Minimum="0"
+                    Maximum="100"
+                    StepFrequency="1"
+                    SmallChange="1"
+                    LargeChange="5"
+                    VerticalAlignment="Center"
+                    ValueChanged="VolumeSlider_ValueChanged"
+                    PointerPressed="VolumeSlider_PointerPressed"
+                    PointerReleased="VolumeSlider_PointerReleased"
+                    PointerCaptureLost="VolumeSlider_PointerCaptureLost" />
+        </Grid>
+
+        <!-- Row 2: Device routing (compact) -->
+        <Grid x:Name="DevicePanel" Grid.Row="2" RowSpacing="4">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <!-- Current/Target device info in one compact line -->
+            <Grid Grid.Row="0" ColumnSpacing="6" Margin="0,0,0,2">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="*" />
                 </Grid.ColumnDefinitions>
 
-                <Border Width="34"
-                        Height="34"
-                        CornerRadius="17"
-                        Background="#1AFFFFFF"
-                        VerticalAlignment="Top">
-                    <FontIcon x:Name="SessionIcon"
-                              FontSize="17"
-                              HorizontalAlignment="Center"
-                              VerticalAlignment="Center" />
-                </Border>
-
-                <StackPanel Grid.Column="1" Spacing="3">
-                    <TextBlock x:Name="TitleTextBlock"
-                               FontSize="15"
-                               FontWeight="SemiBold"
-                               TextTrimming="CharacterEllipsis"
-                               MaxLines="1" />
-                    <TextBlock x:Name="ProcessTextBlock"
-                               FontSize="11"
-                               Foreground="#FFC8C8C8"
-                               TextTrimming="CharacterEllipsis"
-                               MaxLines="1" />
-                </StackPanel>
-            </Grid>
-
-            <Grid RowSpacing="6" ColumnSpacing="10">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                </Grid.RowDefinitions>
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="42" />
-                    <ColumnDefinition Width="*" />
-                </Grid.ColumnDefinitions>
-
-                <TextBlock Text="Current"
-                           FontSize="11"
-                           Foreground="#FF9A9A9A"
-                           VerticalAlignment="Center" />
-                <TextBlock x:Name="ActualDeviceTextBlock"
+                <FontIcon Glyph="&#xE7F5;"
+                          FontSize="10"
+                          Foreground="#FF777777"
+                          VerticalAlignment="Center" />
+                <TextBlock x:Name="DeviceInfoTextBlock"
                            Grid.Column="1"
-                           FontSize="12"
-                           TextTrimming="CharacterEllipsis"
-                           MaxLines="1" />
-
-                <TextBlock Grid.Row="1"
-                           Text="Target"
                            FontSize="11"
-                           Foreground="#FF9A9A9A"
-                           VerticalAlignment="Center" />
-                <TextBlock x:Name="BoundDeviceTextBlock"
-                           Grid.Row="1"
-                           Grid.Column="1"
-                           FontSize="12"
-                           Foreground="#FFBEBEBE"
+                           Foreground="#FF888888"
                            TextTrimming="CharacterEllipsis"
                            MaxLines="1" />
             </Grid>
 
-            <StackPanel Spacing="7">
-                <TextBlock x:Name="RouteLabelTextBlock"
-                           FontSize="11"
-                           Foreground="#FFC8C8C8"
-                           FontWeight="SemiBold" />
-                <ComboBox x:Name="DeviceComboBox"
-                          DisplayMemberPath="Title"
-                          MaxDropDownHeight="420"
-                          SelectionChanged="DeviceComboBox_SelectionChanged"
-                          DropDownOpened="DeviceComboBox_DropDownOpened"
-                          DropDownClosed="DeviceComboBox_DropDownClosed" />
-            </StackPanel>
-
-            <StackPanel Spacing="7">
-                <Grid>
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="Auto" />
-                    </Grid.ColumnDefinitions>
-
-                    <TextBlock x:Name="VolumeLabelTextBlock"
-                               FontSize="11"
-                               Foreground="#FFC8C8C8"
-                               FontWeight="SemiBold" />
-                    <Border Grid.Column="1"
-                            Padding="8,3"
-                            Background="#143AA5FF"
-                            CornerRadius="999">
-                        <TextBlock x:Name="VolumeValueTextBlock"
-                                   Foreground="#FF8FD0FF"
-                                   FontWeight="SemiBold"
-                                   FontSize="11" />
-                    </Border>
-                </Grid>
-
-                <Slider x:Name="VolumeSlider"
-                        Minimum="0"
-                        Maximum="100"
-                        StepFrequency="1"
-                        SmallChange="1"
-                        LargeChange="5"
-                        ValueChanged="VolumeSlider_ValueChanged"
-                        PointerPressed="VolumeSlider_PointerPressed"
-                        PointerReleased="VolumeSlider_PointerReleased"
-                        PointerCaptureLost="VolumeSlider_PointerCaptureLost" />
-            </StackPanel>
-        </StackPanel>
-    </Border>
+            <!-- Device selector dropdown -->
+            <ComboBox x:Name="DeviceComboBox"
+                      Grid.Row="1"
+                      DisplayMemberPath="Title"
+                      HorizontalAlignment="Stretch"
+                      MaxDropDownHeight="420"
+                      FontSize="12"
+                      SelectionChanged="DeviceComboBox_SelectionChanged"
+                      DropDownOpened="DeviceComboBox_DropDownOpened"
+                      DropDownClosed="DeviceComboBox_DropDownClosed" />
+        </Grid>
+    </Grid>
 </UserControl>
