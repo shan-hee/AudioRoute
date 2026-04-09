@@ -118,7 +118,32 @@ public sealed class AudioDevice
 
 public static class DeviceEnumerator
 {
-    public static List<AudioDevice> EnumerateDevices(EDataFlow flow = EDataFlow.eAll)
+    private static readonly object DeviceCacheSync = new();
+    private static readonly Dictionary<EDataFlow, CachedDevices> DeviceCache = new();
+    private static readonly TimeSpan DeviceCacheDuration = TimeSpan.FromSeconds(2);
+
+    public static IReadOnlyList<AudioDevice> EnumerateDevices(EDataFlow flow = EDataFlow.eAll)
+    {
+        var now = DateTimeOffset.UtcNow;
+
+        lock (DeviceCacheSync)
+        {
+            if (DeviceCache.TryGetValue(flow, out var cachedDevices) &&
+                cachedDevices.ExpiresAt > now)
+            {
+                return cachedDevices.Devices;
+            }
+        }
+
+        var devices = EnumerateDevicesCore(flow);
+
+        lock (DeviceCacheSync)
+            DeviceCache[flow] = new CachedDevices(devices, now + DeviceCacheDuration);
+
+        return devices;
+    }
+
+    private static AudioDevice[] EnumerateDevicesCore(EDataFlow flow)
     {
         var devices = new List<AudioDevice>();
         var enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorComObject();
@@ -152,6 +177,10 @@ public static class DeviceEnumerator
                     continue;
 
                 collection.GetCount(out var count);
+                var requiredCapacity = devices.Count + (int)count;
+                if (devices.Capacity < requiredCapacity)
+                    devices.Capacity = requiredCapacity;
+
                 for (uint i = 0; i < count; i++)
                 {
                     if (collection.Item(i, out var device) != 0)
@@ -192,6 +221,8 @@ public static class DeviceEnumerator
             Marshal.ReleaseComObject(enumerator);
         }
 
-        return devices;
+        return devices.ToArray();
     }
+
+    private sealed record CachedDevices(IReadOnlyList<AudioDevice> Devices, DateTimeOffset ExpiresAt);
 }

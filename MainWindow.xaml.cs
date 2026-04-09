@@ -172,8 +172,10 @@ public sealed partial class MainWindow : Window
     private void RefreshDataCore()
     {
         var devices = DeviceEnumerator.EnumerateDevices(EDataFlow.eAll);
-        var outputSessions = AudioSessionService.GetActiveSessions(EDataFlow.eRender);
-        var inputSessions = AudioSessionService.GetActiveSessions(EDataFlow.eCapture);
+        var outputDeviceMap = CreateDeviceMap(devices, EDataFlow.eRender);
+        var inputDeviceMap = CreateDeviceMap(devices, EDataFlow.eCapture);
+        var outputSessions = AudioSessionService.GetActiveSessions(EDataFlow.eRender, outputDeviceMap);
+        var inputSessions = AudioSessionService.GetActiveSessions(EDataFlow.eCapture, inputDeviceMap);
         var sessions = MergeSessions(outputSessions, inputSessions);
 
         if (sessions.Count == 0)
@@ -208,6 +210,19 @@ public sealed partial class MainWindow : Window
 
         RemoveInactiveCards(activeKeys);
         ReplaceSessionHostChildren(desiredCards);
+    }
+
+    private static IReadOnlyDictionary<string, AudioDevice> CreateDeviceMap(IReadOnlyList<AudioDevice> devices, EDataFlow flow)
+    {
+        var deviceMap = new Dictionary<string, AudioDevice>(devices.Count, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var device in devices)
+        {
+            if (device.Flow == flow)
+                deviceMap[device.Id] = device;
+        }
+
+        return deviceMap;
     }
 
     private FrameworkElement BuildPlaceholder(string message)

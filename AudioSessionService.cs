@@ -11,10 +11,14 @@ namespace AudioRoute;
 
 public static class AudioSessionService
 {
-    public static IReadOnlyList<MixerSessionInfo> GetActiveSessions(EDataFlow flow)
+    private static readonly object ProcessMetadataCacheSync = new();
+    private static readonly Dictionary<int, CachedProcessMetadata> ProcessMetadataCache = new();
+    private static readonly Dictionary<string, string> FileDescriptionCache = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly TimeSpan ProcessMetadataCacheDuration = TimeSpan.FromSeconds(10);
+
+    public static IReadOnlyList<MixerSessionInfo> GetActiveSessions(EDataFlow flow, IReadOnlyDictionary<string, AudioDevice>? deviceMap = null)
     {
-        var devices = DeviceEnumerator.EnumerateDevices(flow);
-        var deviceMap = devices.ToDictionary(device => device.Id, StringComparer.OrdinalIgnoreCase);
+        deviceMap ??= CreateDeviceMap(DeviceEnumerator.EnumerateDevices(flow), flow);
         var aggregates = new Dictionary<string, SessionAggregate>(StringComparer.OrdinalIgnoreCase);
 
         using var enumerator = new MMDeviceEnumerator();
@@ -92,26 +96,16 @@ public static class AudioSessionService
                 isSystemSession: true);
         }
 
-        var processName = $"PID {processId}";
         var displayName = session.DisplayName;
-        string? executablePath = null;
+        var processMetadata = TryGetProcessMetadata(processId);
+        var processName = processMetadata?.ProcessName ?? $"PID {processId}";
+        var executablePath = processMetadata?.ExecutablePath;
 
-        try
-        {
-            using var process = Process.GetProcessById(processId);
-            processName = process.ProcessName;
-            executablePath = TryGetProcessPath(process);
+        if (string.IsNullOrWhiteSpace(displayName))
+            displayName = processMetadata?.FileDescription;
 
-            if (string.IsNullOrWhiteSpace(displayName))
-                displayName = TryGetFileDescription(executablePath);
-
-            if (string.IsNullOrWhiteSpace(displayName) && !string.IsNullOrWhiteSpace(process.MainWindowTitle))
-                displayName = process.MainWindowTitle;
-        }
-        catch
-        {
-            // Ignore processes that have already exited or deny access.
-        }
+        if (string.IsNullOrWhiteSpace(displayName))
+            displayName = processMetadata?.MainWindowTitle;
 
         if (string.IsNullOrWhiteSpace(displayName))
             displayName = processName;
@@ -167,6 +161,109 @@ public static class AudioSessionService
         {
             return Path.GetFileNameWithoutExtension(executablePath);
         }
+    }
+
+    private static IReadOnlyDictionary<string, AudioDevice> CreateDeviceMap(IReadOnlyList<AudioDevice> devices, EDataFlow flow)
+    {
+        var deviceMap = new Dictionary<string, AudioDevice>(devices.Count, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var device in devices)
+        {
+            if (device.Flow == flow)
+                deviceMap[device.Id] = device;
+        }
+
+        return deviceMap;
+    }
+
+    private static ProcessMetadata? TryGetProcessMetadata(int processId)
+    {
+        var now = DateTimeOffset.UtcNow;
+
+        lock (ProcessMetadataCacheSync)
+        {
+            if (ProcessMetadataCache.TryGetValue(processId, out var cachedMetadata) &&
+                cachedMetadata.ExpiresAt > now)
+            {
+                return cachedMetadata.Metadata;
+            }
+        }
+
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            var metadata = new ProcessMetadata(
+                process.ProcessName,
+                TryGetProcessPath(process),
+                null,
+                string.IsNullOrWhiteSpace(process.MainWindowTitle) ? null : process.MainWindowTitle);
+
+            metadata = metadata with
+            {
+                FileDescription = TryGetCachedFileDescription(metadata.ExecutablePath)
+            };
+
+            lock (ProcessMetadataCacheSync)
+            {
+                ProcessMetadataCache[processId] = new CachedProcessMetadata(metadata, now + ProcessMetadataCacheDuration);
+                if (ProcessMetadataCache.Count > 128)
+                    TrimExpiredProcessMetadata(now);
+            }
+
+            return metadata;
+        }
+        catch
+        {
+            // Ignore processes that have already exited or deny access.
+            return null;
+        }
+    }
+
+    private static string? TryGetCachedFileDescription(string? executablePath)
+    {
+        if (string.IsNullOrWhiteSpace(executablePath) || !File.Exists(executablePath))
+            return null;
+
+        lock (ProcessMetadataCacheSync)
+        {
+            if (FileDescriptionCache.TryGetValue(executablePath, out var cachedDescription))
+                return cachedDescription;
+        }
+
+        var description = TryGetFileDescription(executablePath);
+        if (string.IsNullOrWhiteSpace(description))
+            return null;
+
+        lock (ProcessMetadataCacheSync)
+        {
+            FileDescriptionCache[executablePath] = description;
+            if (FileDescriptionCache.Count > 256)
+            {
+                using var enumerator = FileDescriptionCache.Keys.GetEnumerator();
+                if (enumerator.MoveNext())
+                    FileDescriptionCache.Remove(enumerator.Current);
+            }
+        }
+
+        return description;
+    }
+
+    private static void TrimExpiredProcessMetadata(DateTimeOffset now)
+    {
+        var expiredProcessIds = ProcessMetadataCache
+            .Where(pair => pair.Value.ExpiresAt <= now)
+            .Select(pair => pair.Key)
+            .ToArray();
+
+        foreach (var processId in expiredProcessIds)
+            ProcessMetadataCache.Remove(processId);
+
+        if (ProcessMetadataCache.Count <= 128)
+            return;
+
+        using var enumerator = ProcessMetadataCache.Keys.GetEnumerator();
+        if (enumerator.MoveNext())
+            ProcessMetadataCache.Remove(enumerator.Current);
     }
 
     private static NAudioDataFlow ToNaudioFlow(EDataFlow flow)
@@ -259,4 +356,12 @@ public static class AudioSessionService
             };
         }
     }
+
+    private sealed record ProcessMetadata(
+        string ProcessName,
+        string? ExecutablePath,
+        string? FileDescription,
+        string? MainWindowTitle);
+
+    private sealed record CachedProcessMetadata(ProcessMetadata Metadata, DateTimeOffset ExpiresAt);
 }
