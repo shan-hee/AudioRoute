@@ -137,7 +137,7 @@
                         Padding="12,9"
                         Background="#14000000"
                         CornerRadius="12">
-                    <TextBlock Text="Press Esc or click outside the panel to dismiss"
+                    <TextBlock Text="Press Esc or click outside the panel to hide it to tray. Left-click tray to open it, right-click for menu."
                                Foreground="{StaticResource PanelMutedBrush}"
                                FontSize="11" />
                 </Border>

@@ -21,38 +21,62 @@ public sealed partial class MainWindow : Window
     private const int PanelWidth = 472;
     private const int PanelHeight = 706;
     private const int ScreenMargin = 18;
+    private const uint TrayIconId = 1;
+    private const uint TrayCallbackMessage = NativeMethods.WmApp + 1;
+    private const uint HomeTrayMenuItemId = 1001;
+    private const uint ExitTrayMenuItemId = 1002;
 
+    private readonly DispatcherQueueTimer deactivateHideTimer;
     private readonly DispatcherQueueTimer refreshTimer;
     private readonly Dictionary<string, SessionCardControl> sessionCards = new(StringComparer.OrdinalIgnoreCase);
     private AppWindow? appWindow;
-    private bool allowDeactivateClose;
+    private IntPtr hwnd;
+    private bool allowDeactivateHide;
     private bool isConfigured;
-    private bool isClosing;
+    private bool isExitRequested;
+    private bool isPanelVisible;
     private bool isRefreshing;
+    private bool isVisibilityTransitioning;
     private bool hasDeferredRefresh;
+    private bool isTrayIconCreated;
+    private DateTimeOffset lastPrimaryTrayInvokeAt;
     private int interactionDepth;
+    private WndProcDelegate? windowProcDelegate;
+    private IntPtr originalWindowProc;
 
     public MainWindow()
     {
         InitializeComponent();
 
         Activated += OnWindowActivated;
+        Closed += OnWindowClosed;
         WindowRoot.Loaded += OnWindowLoaded;
         WindowRoot.KeyDown += OnWindowRootKeyDown;
+
+        deactivateHideTimer = DispatcherQueue.GetForCurrentThread().CreateTimer();
+        deactivateHideTimer.Interval = TimeSpan.FromMilliseconds(140);
+        deactivateHideTimer.IsRepeating = false;
+        deactivateHideTimer.Tick += async (_, _) =>
+        {
+            deactivateHideTimer.Stop();
+
+            if (allowDeactivateHide && !isExitRequested && isPanelVisible && !isVisibilityTransitioning)
+                await HideToTrayAsync();
+        };
 
         refreshTimer = DispatcherQueue.GetForCurrentThread().CreateTimer();
         refreshTimer.Interval = TimeSpan.FromSeconds(8);
         refreshTimer.Tick += (_, _) =>
         {
-            if (!isClosing)
+            if (!isExitRequested && isPanelVisible)
                 RefreshData();
         };
-        refreshTimer.Start();
 
         UpdateFlowButtons();
     }
 
     private EDataFlow CurrentFlow { get; set; } = EDataFlow.eRender;
+    public bool IsPanelVisible => isPanelVisible;
 
     private async void OnWindowLoaded(object sender, RoutedEventArgs e)
     {
@@ -62,26 +86,25 @@ public sealed partial class MainWindow : Window
         isConfigured = true;
 
         ConfigureWindow();
+        InitializeTrayIcon();
         RefreshData();
-        await ShowPanelAsync();
-        allowDeactivateClose = true;
-        DismissButton.Focus(FocusState.Programmatic);
+        await ShowPanelAsync(focusDismissButton: true);
     }
 
-    private async void OnWindowActivated(object sender, WindowActivatedEventArgs args)
+    private void OnWindowActivated(object sender, WindowActivatedEventArgs args)
     {
         if (args.WindowActivationState != WindowActivationState.Deactivated)
             return;
 
-        if (!allowDeactivateClose || isClosing)
+        if (!allowDeactivateHide || isExitRequested || !isPanelVisible || isVisibilityTransitioning)
             return;
 
-        await HidePanelAndExitAsync();
+        ScheduleDeactivateHide();
     }
 
     private async void DismissButton_Click(object sender, RoutedEventArgs e)
     {
-        await HidePanelAndExitAsync();
+        await HideToTrayAsync();
     }
 
     private void RefreshButton_Click(object sender, RoutedEventArgs e)
@@ -105,12 +128,12 @@ public sealed partial class MainWindow : Window
             return;
 
         e.Handled = true;
-        await HidePanelAndExitAsync();
+        await HideToTrayAsync();
     }
 
     private void RefreshData()
     {
-        if (isClosing)
+        if (isExitRequested)
             return;
 
         if (isRefreshing)
@@ -135,7 +158,7 @@ public sealed partial class MainWindow : Window
         {
             isRefreshing = false;
 
-            if (hasDeferredRefresh && interactionDepth == 0 && !isClosing)
+            if (hasDeferredRefresh && interactionDepth == 0 && !isExitRequested)
             {
                 hasDeferredRefresh = false;
                 RefreshData();
@@ -283,26 +306,118 @@ public sealed partial class MainWindow : Window
             RefreshData();
     }
 
-    private async Task ShowPanelAsync()
+    public Task ShowOrBringToFrontAsync()
     {
-        var visual = ElementCompositionPreview.GetElementVisual(PanelSurface);
-        visual.Opacity = 0f;
-        visual.Offset = new Vector3(0f, 26f, 0f);
-        await AnimatePanelAsync(visual, new Vector3(0f, 26f, 0f), Vector3.Zero, 0f, 1f);
+        CancelDeactivateHide();
+
+        if (!isConfigured || isExitRequested || isVisibilityTransitioning)
+            return Task.CompletedTask;
+
+        if (isPanelVisible)
+        {
+            BringPanelToFront();
+            return Task.CompletedTask;
+        }
+
+        return ShowPanelAsync(focusDismissButton: true);
     }
 
-    private async Task HidePanelAndExitAsync()
+    public void PrepareForExit()
     {
-        if (isClosing)
+        if (isExitRequested)
             return;
 
-        isClosing = true;
-        allowDeactivateClose = false;
+        isExitRequested = true;
+        allowDeactivateHide = false;
+        deactivateHideTimer.Stop();
+        refreshTimer.Stop();
+        DisposeTrayIcon();
+    }
+
+    private async Task ShowPanelAsync(bool focusDismissButton = false)
+    {
+        if (!isConfigured || isExitRequested || isVisibilityTransitioning || isPanelVisible)
+            return;
+
+        CancelDeactivateHide();
+        isVisibilityTransitioning = true;
+        allowDeactivateHide = false;
+
+        try
+        {
+            RefreshData();
+            refreshTimer.Start();
+            UpdateWindowPosition();
+
+            var visual = ElementCompositionPreview.GetElementVisual(PanelSurface);
+            visual.Opacity = 0f;
+            visual.Offset = new Vector3(0f, 26f, 0f);
+
+            NativeMethods.ShowWindow(hwnd, NativeMethods.SwShow);
+            Activate();
+            NativeMethods.SetTopMost(hwnd);
+
+            await AnimatePanelAsync(visual, new Vector3(0f, 26f, 0f), Vector3.Zero, 0f, 1f);
+            isPanelVisible = true;
+            allowDeactivateHide = true;
+        }
+        finally
+        {
+            isVisibilityTransitioning = false;
+            allowDeactivateHide = isPanelVisible && !isExitRequested;
+        }
+
+        if (focusDismissButton)
+            DismissButton.Focus(FocusState.Programmatic);
+    }
+
+    private async Task HideToTrayAsync()
+    {
+        if (!isConfigured || isExitRequested || isVisibilityTransitioning || !isPanelVisible)
+            return;
+
+        CancelDeactivateHide();
+        isVisibilityTransitioning = true;
+        allowDeactivateHide = false;
         refreshTimer.Stop();
 
-        var visual = ElementCompositionPreview.GetElementVisual(PanelSurface);
-        await AnimatePanelAsync(visual, Vector3.Zero, new Vector3(0f, 24f, 0f), 1f, 0f);
-        Close();
+        try
+        {
+            var visual = ElementCompositionPreview.GetElementVisual(PanelSurface);
+            await AnimatePanelAsync(visual, Vector3.Zero, new Vector3(0f, 24f, 0f), 1f, 0f);
+            NativeMethods.ShowWindow(hwnd, NativeMethods.SwHide);
+            isPanelVisible = false;
+        }
+        finally
+        {
+            isVisibilityTransitioning = false;
+        }
+    }
+
+    private void BringPanelToFront()
+    {
+        if (!isConfigured || isExitRequested)
+            return;
+
+        UpdateWindowPosition();
+        NativeMethods.ShowWindow(hwnd, NativeMethods.SwShow);
+        Activate();
+        NativeMethods.SetForegroundWindow(hwnd);
+        NativeMethods.SetTopMost(hwnd);
+        allowDeactivateHide = true;
+        DismissButton.Focus(FocusState.Programmatic);
+    }
+
+    private void ScheduleDeactivateHide()
+    {
+        deactivateHideTimer.Stop();
+        deactivateHideTimer.Start();
+    }
+
+    private void CancelDeactivateHide()
+    {
+        if (deactivateHideTimer.IsRunning)
+            deactivateHideTimer.Stop();
     }
 
     private static Task AnimatePanelAsync(Visual visual, Vector3 fromOffset, Vector3 toOffset, float fromOpacity, float toOpacity)
@@ -336,7 +451,7 @@ public sealed partial class MainWindow : Window
 
     private void ConfigureWindow()
     {
-        var hwnd = WindowNative.GetWindowHandle(this);
+        hwnd = WindowNative.GetWindowHandle(this);
         var windowId = Microsoft.UI.Win32Interop.GetWindowIdFromWindow(hwnd);
         appWindow = AppWindow.GetFromWindowId(windowId);
 
@@ -349,14 +464,230 @@ public sealed partial class MainWindow : Window
         }
 
         NativeMethods.ApplyToolWindowStyle(hwnd);
+        AttachWindowProc();
         appWindow.Resize(new SizeInt32(PanelWidth, PanelHeight));
+        UpdateWindowPosition();
+        NativeMethods.SetTopMost(hwnd);
+    }
 
+    private void InitializeTrayIcon()
+    {
+        if (isTrayIconCreated)
+            return;
+
+        var iconHandle = NativeMethods.LoadApplicationIcon();
+        var notifyIconData = CreateTrayIconData(iconHandle);
+
+        if (!NativeMethods.ShellNotifyIcon(NativeMethods.NimAdd, ref notifyIconData))
+            return;
+
+        notifyIconData.uVersionOrTimeout = NativeMethods.NotifyIconVersion4;
+        _ = NativeMethods.ShellNotifyIcon(NativeMethods.NimSetVersion, ref notifyIconData);
+        isTrayIconCreated = true;
+    }
+
+    private void DisposeTrayIcon()
+    {
+        if (isTrayIconCreated)
+        {
+            var notifyIconData = CreateTrayIconData(IntPtr.Zero);
+            _ = NativeMethods.ShellNotifyIcon(NativeMethods.NimDelete, ref notifyIconData);
+            isTrayIconCreated = false;
+        }
+
+        DetachWindowProc();
+    }
+
+    private void AttachWindowProc()
+    {
+        if (originalWindowProc != IntPtr.Zero)
+            return;
+
+        windowProcDelegate = WindowProc;
+        var windowProcPointer = Marshal.GetFunctionPointerForDelegate(windowProcDelegate);
+        originalWindowProc = NativeMethods.SetWindowProc(hwnd, windowProcPointer);
+    }
+
+    private void DetachWindowProc()
+    {
+        if (originalWindowProc == IntPtr.Zero || hwnd == IntPtr.Zero)
+            return;
+
+        _ = NativeMethods.SetWindowProc(hwnd, originalWindowProc);
+        originalWindowProc = IntPtr.Zero;
+        windowProcDelegate = null;
+    }
+
+    private NativeMethods.NotifyIconData CreateTrayIconData(IntPtr iconHandle)
+    {
+        return new NativeMethods.NotifyIconData
+        {
+            cbSize = (uint)Marshal.SizeOf<NativeMethods.NotifyIconData>(),
+            hWnd = hwnd,
+            uID = TrayIconId,
+            uFlags = NativeMethods.NifMessage | NativeMethods.NifIcon | NativeMethods.NifTip | NativeMethods.NifShowTip,
+            uCallbackMessage = TrayCallbackMessage,
+            hIcon = iconHandle,
+            szTip = "AudioRoute",
+            szInfo = string.Empty,
+            szInfoTitle = string.Empty,
+            uVersionOrTimeout = 0
+        };
+    }
+
+    private IntPtr WindowProc(IntPtr windowHandle, uint message, IntPtr wParam, IntPtr lParam)
+    {
+        if (message == NativeMethods.WmTaskbarCreated)
+        {
+            if (!isExitRequested)
+            {
+                isTrayIconCreated = false;
+                InitializeTrayIcon();
+            }
+
+            return IntPtr.Zero;
+        }
+
+        if (message == TrayCallbackMessage)
+        {
+            HandleTrayMessage(NativeMethods.GetLowWord(lParam), wParam);
+            return IntPtr.Zero;
+        }
+
+        if (message == NativeMethods.WmCommand)
+        {
+            var commandId = NativeMethods.GetLowWord(wParam);
+            if (commandId == HomeTrayMenuItemId)
+            {
+                _ = ShowOrBringToFrontAsync();
+                return IntPtr.Zero;
+            }
+
+            if (commandId == ExitTrayMenuItemId)
+            {
+                RequestExit();
+                return IntPtr.Zero;
+            }
+        }
+
+        return originalWindowProc != IntPtr.Zero
+            ? NativeMethods.CallWindowProc(originalWindowProc, windowHandle, message, wParam, lParam)
+            : NativeMethods.DefWindowProc(windowHandle, message, wParam, lParam);
+    }
+
+    private void HandleTrayMessage(uint trayMessage, IntPtr invokePointData)
+    {
+        if (isExitRequested)
+            return;
+
+        if (trayMessage == NativeMethods.NinSelect || trayMessage == NativeMethods.WmLButtonUp)
+        {
+            if (DateTimeOffset.UtcNow - lastPrimaryTrayInvokeAt < TimeSpan.FromMilliseconds(200))
+                return;
+
+            lastPrimaryTrayInvokeAt = DateTimeOffset.UtcNow;
+            CancelDeactivateHide();
+            _ = ShowOrBringToFrontAsync();
+
+            return;
+        }
+
+        if (trayMessage == NativeMethods.WmRButtonUp || trayMessage == NativeMethods.WmContextMenu)
+        {
+            CancelDeactivateHide();
+            ShowTrayContextMenu(GetTrayMenuAnchorPoint(invokePointData));
+        }
+    }
+
+    private Point GetTrayMenuAnchorPoint(IntPtr invokePointData)
+    {
+        var callbackPoint = NativeMethods.GetPointFromLParam(invokePointData);
+        if (callbackPoint.X != 0 || callbackPoint.Y != 0)
+            return callbackPoint;
+
+        if (TryGetTrayIconRect(out var trayIconRect))
+        {
+            return new Point
+            {
+                X = trayIconRect.Left,
+                Y = trayIconRect.Bottom
+            };
+        }
+
+        return NativeMethods.GetCursorPos(out var cursorPosition)
+            ? cursorPosition
+            : default;
+    }
+
+    private bool TryGetTrayIconRect(out Rect trayIconRect)
+    {
+        var identifier = new NativeMethods.NotifyIconIdentifier
+        {
+            cbSize = (uint)Marshal.SizeOf<NativeMethods.NotifyIconIdentifier>(),
+            hWnd = hwnd,
+            uID = TrayIconId
+        };
+
+        return NativeMethods.ShellNotifyIconGetRect(ref identifier, out trayIconRect) == 0;
+    }
+
+    private void ShowTrayContextMenu(Point anchorPoint)
+    {
+        var menuHandle = NativeMethods.CreatePopupMenu();
+        if (menuHandle == IntPtr.Zero)
+            return;
+
+        try
+        {
+            if (anchorPoint.X == 0 && anchorPoint.Y == 0)
+            {
+                if (!NativeMethods.GetCursorPos(out anchorPoint))
+                    return;
+            }
+
+            _ = NativeMethods.AppendMenu(menuHandle, NativeMethods.MfString, HomeTrayMenuItemId, "\u4E3B\u9875");
+            _ = NativeMethods.AppendMenu(menuHandle, NativeMethods.MfString, ExitTrayMenuItemId, "\u9000\u51FA");
+
+            NativeMethods.SetForegroundWindow(hwnd);
+            _ = NativeMethods.TrackPopupMenu(
+                menuHandle,
+                NativeMethods.TpmBottomAlign | NativeMethods.TpmLeftAlign | NativeMethods.TpmRightButton,
+                anchorPoint.X,
+                anchorPoint.Y,
+                0,
+                hwnd,
+                IntPtr.Zero);
+
+            _ = NativeMethods.PostMessage(hwnd, NativeMethods.WmNull, IntPtr.Zero, IntPtr.Zero);
+        }
+        finally
+        {
+            _ = NativeMethods.DestroyMenu(menuHandle);
+        }
+    }
+
+    private void RequestExit()
+    {
+        PrepareForExit();
+        Close();
+        App.Current.Exit();
+    }
+
+    private void OnWindowClosed(object sender, WindowEventArgs args)
+    {
+        PrepareForExit();
+    }
+
+    private void UpdateWindowPosition()
+    {
+        if (appWindow is null)
+            return;
+
+        var windowId = Microsoft.UI.Win32Interop.GetWindowIdFromWindow(hwnd);
         var displayArea = DisplayArea.GetFromWindowId(windowId, DisplayAreaFallback.Primary);
         var x = displayArea.WorkArea.X + displayArea.WorkArea.Width - PanelWidth - ScreenMargin;
         var y = displayArea.WorkArea.Y + displayArea.WorkArea.Height - PanelHeight - ScreenMargin;
         appWindow.Move(new PointInt32(x, y));
-
-        NativeMethods.SetTopMost(hwnd);
     }
 
     private void ShowError(string message)
@@ -434,11 +765,35 @@ public sealed partial class MainWindow : Window
     private static class NativeMethods
     {
         private const int GwlExStyle = -20;
+        private const int GwlWndProc = -4;
+        private const int IdiApplication = 32512;
         private const int WsExAppWindow = 0x00040000;
         private const int WsExToolWindow = 0x00000080;
+        public const int SwHide = 0;
+        public const int SwShow = 5;
+        public const uint WmApp = 0x8000;
+        public const uint WmCommand = 0x0111;
+        public const uint WmContextMenu = 0x007B;
+        public const uint WmLButtonUp = 0x0202;
+        public const uint WmNull = 0x0000;
+        public const uint WmRButtonUp = 0x0205;
+        public const uint NinSelect = 0x0400;
+        public const uint NimAdd = 0x00000000;
+        public const uint NimDelete = 0x00000002;
+        public const uint NimSetVersion = 0x00000004;
+        public const uint NifMessage = 0x00000001;
+        public const uint NifIcon = 0x00000002;
+        public const uint NifTip = 0x00000004;
+        public const uint NifShowTip = 0x00000080;
+        public const uint NotifyIconVersion4 = 4;
+        public const uint MfString = 0x00000000;
+        public static readonly uint WmTaskbarCreated = RegisterWindowMessage("TaskbarCreated");
         private const uint SwpNomove = 0x0002;
         private const uint SwpNosize = 0x0001;
         private const uint SwpNoactivate = 0x0010;
+        public const uint TpmBottomAlign = 0x0020;
+        public const uint TpmLeftAlign = 0x0000;
+        public const uint TpmRightButton = 0x0002;
         private static readonly IntPtr HwndTopMost = new(-1);
 
         public static void ApplyToolWindowStyle(IntPtr hwnd)
@@ -454,6 +809,41 @@ public sealed partial class MainWindow : Window
             _ = SetWindowPos(hwnd, HwndTopMost, 0, 0, 0, 0, SwpNomove | SwpNosize | SwpNoactivate);
         }
 
+        public static void ShowWindow(IntPtr hwnd, int command)
+        {
+            _ = ShowWindowNative(hwnd, command);
+        }
+
+        public static IntPtr SetWindowProc(IntPtr hwnd, IntPtr windowProc)
+        {
+            return SetWindowLongPtr(hwnd, GwlWndProc, windowProc);
+        }
+
+        public static bool ShellNotifyIcon(uint message, ref NotifyIconData notifyIconData)
+        {
+            return Shell_NotifyIcon(message, ref notifyIconData);
+        }
+
+        public static IntPtr LoadApplicationIcon()
+        {
+            return LoadIcon(IntPtr.Zero, new IntPtr(IdiApplication));
+        }
+
+        public static uint GetLowWord(IntPtr value)
+        {
+            return (uint)(value.ToInt64() & 0xFFFF);
+        }
+
+        public static Point GetPointFromLParam(IntPtr value)
+        {
+            var raw = value.ToInt64();
+            return new Point
+            {
+                X = unchecked((short)(raw & 0xFFFF)),
+                Y = unchecked((short)((raw >> 16) & 0xFFFF))
+            };
+        }
+
         [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW", SetLastError = true)]
         private static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
 
@@ -462,5 +852,103 @@ public sealed partial class MainWindow : Window
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint uFlags);
+
+        [DllImport("user32.dll", EntryPoint = "ShowWindow", SetLastError = true)]
+        private static extern bool ShowWindowNative(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll", EntryPoint = "CallWindowProcW", SetLastError = true)]
+        public static extern IntPtr CallWindowProc(IntPtr lpPrevWndFunc, IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", EntryPoint = "DefWindowProcW", SetLastError = true)]
+        public static extern IntPtr DefWindowProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr CreatePopupMenu();
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool AppendMenu(IntPtr hMenu, uint uFlags, uint uIDNewItem, string lpNewItem);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool DestroyMenu(IntPtr hMenu);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool GetCursorPos(out Point cursorPosition);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool TrackPopupMenu(IntPtr hMenu, uint uFlags, int x, int y, int nReserved, IntPtr hWnd, IntPtr prcRect);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr LoadIcon(IntPtr hInstance, IntPtr lpIconName);
+
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool Shell_NotifyIcon(uint dwMessage, ref NotifyIconData lpData);
+
+        [DllImport("shell32.dll", EntryPoint = "Shell_NotifyIconGetRect", SetLastError = true)]
+        public static extern int ShellNotifyIconGetRect(ref NotifyIconIdentifier identifier, out Rect iconLocation);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint RegisterWindowMessage(string lpString);
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct NotifyIconData
+        {
+            public uint cbSize;
+            public IntPtr hWnd;
+            public uint uID;
+            public uint uFlags;
+            public uint uCallbackMessage;
+            public IntPtr hIcon;
+
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+            public string szTip;
+
+            public uint dwState;
+            public uint dwStateMask;
+
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+            public string szInfo;
+
+            public uint uVersionOrTimeout;
+
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+            public string szInfoTitle;
+
+            public uint dwInfoFlags;
+            public Guid guidItem;
+            public IntPtr hBalloonIcon;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct NotifyIconIdentifier
+        {
+            public uint cbSize;
+            public IntPtr hWnd;
+            public uint uID;
+            public Guid guidItem;
+        }
     }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Point
+    {
+        public int X;
+        public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Rect
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    private delegate IntPtr WndProcDelegate(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 }
