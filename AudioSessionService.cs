@@ -11,10 +11,10 @@ namespace AudioRoute;
 
 public static class AudioSessionService
 {
-    private static readonly object ProcessMetadataCacheSync = new();
-    private static readonly Dictionary<int, CachedProcessMetadata> ProcessMetadataCache = new();
-    private static readonly Dictionary<string, string> FileDescriptionCache = new(StringComparer.OrdinalIgnoreCase);
     private static readonly TimeSpan ProcessMetadataCacheDuration = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan FileDescriptionCacheDuration = TimeSpan.FromMinutes(30);
+    private static readonly ExpiringCache<int, ProcessMetadata> ProcessMetadataCache = new(ProcessMetadataCacheDuration, 128);
+    private static readonly ExpiringCache<string, string> FileDescriptionCache = new(FileDescriptionCacheDuration, 256, StringComparer.OrdinalIgnoreCase);
 
     public static IReadOnlyList<MixerSessionInfo> GetActiveSessions(EDataFlow flow, IReadOnlyDictionary<string, AudioDevice>? deviceMap = null)
     {
@@ -27,23 +27,45 @@ public static class AudioSessionService
         for (var deviceIndex = 0; deviceIndex < audioDevices.Count; deviceIndex++)
         {
             using var audioDevice = audioDevices[deviceIndex];
-            var sessions = audioDevice.AudioSessionManager.Sessions;
-
-            for (var sessionIndex = 0; sessionIndex < sessions.Count; sessionIndex++)
+            var audioSessionManager = audioDevice.AudioSessionManager;
+            try
             {
-                using var session = sessions[sessionIndex];
-                if (!ShouldIncludeSession(session))
-                    continue;
-
-                var processId = checked((int)session.GetProcessID);
-                var sessionKey = BuildSessionKey(session, processId);
-                if (!aggregates.TryGetValue(sessionKey, out var aggregate))
+                var sessions = audioSessionManager.Sessions;
+                try
                 {
-                    aggregate = CreateAggregate(session, flow, processId);
-                    aggregates.Add(sessionKey, aggregate);
-                }
+                    for (var sessionIndex = 0; sessionIndex < sessions.Count; sessionIndex++)
+                    {
+                        using var session = sessions[sessionIndex];
+                        if (!ShouldIncludeSession(session))
+                            continue;
 
-                aggregate.AddSample(audioDevice.FriendlyName, session.SimpleAudioVolume.Volume, session.SimpleAudioVolume.Mute);
+                        var processId = checked((int)session.GetProcessID);
+                        var sessionKey = BuildSessionKey(session, processId);
+                        if (!aggregates.TryGetValue(sessionKey, out var aggregate))
+                        {
+                            aggregate = CreateAggregate(session, flow, processId);
+                            aggregates.Add(sessionKey, aggregate);
+                        }
+
+                        var simpleAudioVolume = session.SimpleAudioVolume;
+                        try
+                        {
+                            aggregate.AddSample(audioDevice.FriendlyName, simpleAudioVolume.Volume, simpleAudioVolume.Mute);
+                        }
+                        finally
+                        {
+                            DisposeIfNeeded(simpleAudioVolume);
+                        }
+                    }
+                }
+                finally
+                {
+                    DisposeIfNeeded(sessions);
+                }
+            }
+            finally
+            {
+                DisposeIfNeeded(audioSessionManager);
             }
         }
 
@@ -58,7 +80,18 @@ public static class AudioSessionService
     {
         var clampedVolume = Math.Clamp(volume, 0f, 1f);
         var sessionMatcher = SessionMatcher.Create(sessionKey);
-        UpdateMatchingSessions(sessionMatcher, flow, session => session.SimpleAudioVolume.Volume = clampedVolume);
+        UpdateMatchingSessions(sessionMatcher, flow, session =>
+        {
+            var simpleAudioVolume = session.SimpleAudioVolume;
+            try
+            {
+                simpleAudioVolume.Volume = clampedVolume;
+            }
+            finally
+            {
+                DisposeIfNeeded(simpleAudioVolume);
+            }
+        });
     }
 
     private static void UpdateMatchingSessions(SessionMatcher sessionMatcher, EDataFlow flow, Action<AudioSessionControl> update)
@@ -69,15 +102,29 @@ public static class AudioSessionService
         for (var deviceIndex = 0; deviceIndex < audioDevices.Count; deviceIndex++)
         {
             using var audioDevice = audioDevices[deviceIndex];
-            var sessions = audioDevice.AudioSessionManager.Sessions;
-
-            for (var sessionIndex = 0; sessionIndex < sessions.Count; sessionIndex++)
+            var audioSessionManager = audioDevice.AudioSessionManager;
+            try
             {
-                using var session = sessions[sessionIndex];
-                if (!sessionMatcher.IsMatch(session))
-                    continue;
+                var sessions = audioSessionManager.Sessions;
+                try
+                {
+                    for (var sessionIndex = 0; sessionIndex < sessions.Count; sessionIndex++)
+                    {
+                        using var session = sessions[sessionIndex];
+                        if (!sessionMatcher.IsMatch(session))
+                            continue;
 
-                update(session);
+                        update(session);
+                    }
+                }
+                finally
+                {
+                    DisposeIfNeeded(sessions);
+                }
+            }
+            finally
+            {
+                DisposeIfNeeded(audioSessionManager);
             }
         }
     }
@@ -178,16 +225,8 @@ public static class AudioSessionService
 
     private static ProcessMetadata? TryGetProcessMetadata(int processId)
     {
-        var now = DateTimeOffset.UtcNow;
-
-        lock (ProcessMetadataCacheSync)
-        {
-            if (ProcessMetadataCache.TryGetValue(processId, out var cachedMetadata) &&
-                cachedMetadata.ExpiresAt > now)
-            {
-                return cachedMetadata.Metadata;
-            }
-        }
+        if (ProcessMetadataCache.TryGetValue(processId, out var cachedMetadata))
+            return cachedMetadata;
 
         try
         {
@@ -203,13 +242,7 @@ public static class AudioSessionService
                 FileDescription = TryGetCachedFileDescription(metadata.ExecutablePath)
             };
 
-            lock (ProcessMetadataCacheSync)
-            {
-                ProcessMetadataCache[processId] = new CachedProcessMetadata(metadata, now + ProcessMetadataCacheDuration);
-                if (ProcessMetadataCache.Count > 128)
-                    TrimExpiredProcessMetadata(now);
-            }
-
+            ProcessMetadataCache.Set(processId, metadata);
             return metadata;
         }
         catch
@@ -224,46 +257,15 @@ public static class AudioSessionService
         if (string.IsNullOrWhiteSpace(executablePath) || !File.Exists(executablePath))
             return null;
 
-        lock (ProcessMetadataCacheSync)
-        {
-            if (FileDescriptionCache.TryGetValue(executablePath, out var cachedDescription))
-                return cachedDescription;
-        }
+        if (FileDescriptionCache.TryGetValue(executablePath, out var cachedDescription))
+            return cachedDescription;
 
         var description = TryGetFileDescription(executablePath);
         if (string.IsNullOrWhiteSpace(description))
             return null;
 
-        lock (ProcessMetadataCacheSync)
-        {
-            FileDescriptionCache[executablePath] = description;
-            if (FileDescriptionCache.Count > 256)
-            {
-                using var enumerator = FileDescriptionCache.Keys.GetEnumerator();
-                if (enumerator.MoveNext())
-                    FileDescriptionCache.Remove(enumerator.Current);
-            }
-        }
-
+        FileDescriptionCache.Set(executablePath, description);
         return description;
-    }
-
-    private static void TrimExpiredProcessMetadata(DateTimeOffset now)
-    {
-        var expiredProcessIds = ProcessMetadataCache
-            .Where(pair => pair.Value.ExpiresAt <= now)
-            .Select(pair => pair.Key)
-            .ToArray();
-
-        foreach (var processId in expiredProcessIds)
-            ProcessMetadataCache.Remove(processId);
-
-        if (ProcessMetadataCache.Count <= 128)
-            return;
-
-        using var enumerator = ProcessMetadataCache.Keys.GetEnumerator();
-        if (enumerator.MoveNext())
-            ProcessMetadataCache.Remove(enumerator.Current);
     }
 
     private static NAudioDataFlow ToNaudioFlow(EDataFlow flow)
@@ -274,6 +276,12 @@ public static class AudioSessionService
             EDataFlow.eCapture => NAudioDataFlow.Capture,
             _ => throw new NotSupportedException($"Unsupported flow: {flow}")
         };
+    }
+
+    private static void DisposeIfNeeded(object? instance)
+    {
+        if (instance is IDisposable disposable)
+            disposable.Dispose();
     }
 
     private sealed class SessionAggregate
@@ -362,8 +370,6 @@ public static class AudioSessionService
         string? ExecutablePath,
         string? FileDescription,
         string? MainWindowTitle);
-
-    private sealed record CachedProcessMetadata(ProcessMetadata Metadata, DateTimeOffset ExpiresAt);
 
     private readonly record struct SessionMatcher(bool IsSystemSession, int ProcessId)
     {

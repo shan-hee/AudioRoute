@@ -21,10 +21,15 @@ public sealed partial class MainWindow : Window
     private const int PanelHeight = 460;
     private const int ScreenMargin = 18;
     private static readonly TimeSpan DeactivateHideDelay = TimeSpan.FromMilliseconds(140);
-    private static readonly TimeSpan ForegroundMonitorInterval = TimeSpan.FromMilliseconds(220);
+    private static readonly TimeSpan ForegroundMonitorInterval = TimeSpan.FromMilliseconds(650);
     private static readonly TimeSpan HideSuppressionDuration = TimeSpan.FromMilliseconds(320);
     private static readonly TimeSpan TrayReopenSuppressionDuration = TimeSpan.FromMilliseconds(300);
-    private static readonly TimeSpan TrayIconRefreshInterval = TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan TrayIconRefreshInterval = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan VisibleRefreshInterval = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan PanelOpenOffsetAnimationDuration = TimeSpan.FromMilliseconds(240);
+    private static readonly TimeSpan PanelOpenOpacityAnimationDuration = TimeSpan.FromMilliseconds(220);
+    private static readonly TimeSpan PanelCloseOffsetAnimationDuration = TimeSpan.FromMilliseconds(120);
+    private static readonly TimeSpan PanelCloseOpacityAnimationDuration = TimeSpan.FromMilliseconds(100);
     private const uint TrayIconId = 1;
     private const uint TrayCallbackMessage = NativeMethods.WmApp + 1;
     private const uint HomeTrayMenuItemId = 1001;
@@ -35,8 +40,8 @@ public sealed partial class MainWindow : Window
     private readonly DispatcherQueueTimer foregroundMonitorTimer;
     private readonly DispatcherQueueTimer refreshTimer;
     private readonly DispatcherQueueTimer trayIconTimer;
+    private readonly StaThreadDispatcher refreshDispatcher;
     private readonly Dictionary<string, SessionCardControl> sessionCards = new(StringComparer.OrdinalIgnoreCase);
-    private readonly bool showOnLaunch;
     private AppWindow? appWindow;
     private IntPtr hwnd;
     private bool allowDeactivateHide;
@@ -50,20 +55,21 @@ public sealed partial class MainWindow : Window
     private DateTimeOffset lastPrimaryTrayInvokeAt;
     private DateTimeOffset suppressPrimaryTrayInvokeUntil;
     private MasterVolumeState? lastTrayVolumeState;
+    private PanelSnapshot? lastSnapshot;
     private DateTimeOffset suppressHideUntil;
     private int interactionDepth;
+    private int refreshGeneration;
     private WndProcDelegate? windowProcDelegate;
     private IntPtr originalWindowProc;
 
-    public MainWindow(bool showOnLaunch = true)
+    public MainWindow()
     {
-        this.showOnLaunch = showOnLaunch;
         InitializeComponent();
+        refreshDispatcher = new StaThreadDispatcher("AudioRoute.Refresh");
         ConfigureWindow();
 
         Activated += OnWindowActivated;
         Closed += OnWindowClosed;
-        WindowRoot.Loaded += OnWindowLoaded;
 
         deactivateHideTimer = DispatcherQueue.GetForCurrentThread().CreateTimer();
         deactivateHideTimer.Interval = DeactivateHideDelay;
@@ -86,7 +92,7 @@ public sealed partial class MainWindow : Window
         };
 
         refreshTimer = DispatcherQueue.GetForCurrentThread().CreateTimer();
-        refreshTimer.Interval = TimeSpan.FromSeconds(8);
+        refreshTimer.Interval = VisibleRefreshInterval;
         refreshTimer.Tick += (_, _) =>
         {
             if (!isExitRequested && isPanelVisible)
@@ -101,24 +107,11 @@ public sealed partial class MainWindow : Window
             if (!isExitRequested && isTrayIconCreated)
                 UpdateTrayIcon();
         };
+
+        EnsureConfigured();
     }
 
     public bool IsPanelVisible => isPanelVisible;
-
-    private async void OnWindowLoaded(object sender, RoutedEventArgs e)
-    {
-        if (isConfigured)
-            return;
-
-        isConfigured = true;
-
-        ConfigureWindow();
-        InitializeTrayIcon();
-        RefreshData();
-
-        if (showOnLaunch)
-            await ShowPanelAsync();
-    }
 
     private void OnWindowActivated(object sender, WindowActivatedEventArgs args)
     {
@@ -126,6 +119,20 @@ public sealed partial class MainWindow : Window
             return;
 
         HandlePanelDeactivated();
+    }
+
+    private void EnsureConfigured()
+    {
+        if (isConfigured || isExitRequested)
+            return;
+
+        ConfigureWindow();
+        if (hwnd == IntPtr.Zero)
+            return;
+
+        isConfigured = true;
+        InitializeTrayIcon();
+        RefreshData();
     }
 
     private void HandlePanelDeactivated()
@@ -141,6 +148,8 @@ public sealed partial class MainWindow : Window
         if (isExitRequested)
             return;
 
+        EnsureConfigured();
+
         if (isRefreshing)
         {
             hasDeferredRefresh = true;
@@ -155,13 +164,33 @@ public sealed partial class MainWindow : Window
 
         hasDeferredRefresh = false;
         isRefreshing = true;
+        var refreshVersion = ++refreshGeneration;
+        _ = RefreshDataAsync(refreshVersion);
+    }
+
+    private async Task RefreshDataAsync(int refreshVersion)
+    {
         try
         {
-            RefreshDataCore();
+            var snapshot = await refreshDispatcher.InvokeAsync(BuildPanelSnapshot);
+            if (isExitRequested || refreshVersion != refreshGeneration)
+                return;
+
+            lastSnapshot = snapshot;
+            ApplyPanelSnapshot(snapshot);
+        }
+        catch when (isExitRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            if (refreshVersion == refreshGeneration && isPanelVisible)
+                ShowPlaceholder($"刷新音频会话失败: {ex.Message}");
         }
         finally
         {
-            isRefreshing = false;
+            if (refreshVersion == refreshGeneration)
+                isRefreshing = false;
 
             if (hasDeferredRefresh && interactionDepth == 0 && !isExitRequested)
             {
@@ -169,49 +198,6 @@ public sealed partial class MainWindow : Window
                 RefreshData();
             }
         }
-    }
-
-    private void RefreshDataCore()
-    {
-        var devices = DeviceEnumerator.EnumerateDevices(EDataFlow.eAll);
-        var outputDeviceMap = CreateDeviceMap(devices, EDataFlow.eRender);
-        var inputDeviceMap = CreateDeviceMap(devices, EDataFlow.eCapture);
-        var outputSessions = AudioSessionService.GetActiveSessions(EDataFlow.eRender, outputDeviceMap);
-        var inputSessions = AudioSessionService.GetActiveSessions(EDataFlow.eCapture, inputDeviceMap);
-        var sessions = MergeSessions(outputSessions, inputSessions);
-
-        if (sessions.Count == 0)
-        {
-            RemoveInactiveCards(Array.Empty<string>());
-            ShowPlaceholder("当前没有活跃的音频会话。");
-            return;
-        }
-
-        var desiredCards = new List<SessionCardControl>(sessions.Count);
-        var activeKeys = new List<string>(sessions.Count);
-
-        foreach (var session in sessions)
-        {
-            activeKeys.Add(session.SessionKey);
-
-            if (!sessionCards.TryGetValue(session.SessionKey, out var card))
-            {
-                card = new SessionCardControl(session, devices);
-                card.DeviceChanged += OnDeviceChanged;
-                card.VolumeChanged += OnVolumeChanged;
-                card.InteractionStateChanged += OnInteractionStateChanged;
-                sessionCards.Add(session.SessionKey, card);
-            }
-            else
-            {
-                card.UpdateSession(session, devices);
-            }
-
-            desiredCards.Add(card);
-        }
-
-        RemoveInactiveCards(activeKeys);
-        ReplaceSessionHostChildren(desiredCards);
     }
 
     private static IReadOnlyDictionary<string, AudioDevice> CreateDeviceMap(IReadOnlyList<AudioDevice> devices, EDataFlow flow)
@@ -242,6 +228,65 @@ public sealed partial class MainWindow : Window
                 Foreground = new Microsoft.UI.Xaml.Media.SolidColorBrush(Windows.UI.Color.FromArgb(255, 160, 160, 160))
             }
         };
+    }
+
+    private static PanelSnapshot BuildPanelSnapshot()
+    {
+        var devices = DeviceEnumerator.EnumerateDevices(EDataFlow.eAll);
+        var outputDeviceMap = CreateDeviceMap(devices, EDataFlow.eRender);
+        var inputDeviceMap = CreateDeviceMap(devices, EDataFlow.eCapture);
+        var outputSessions = AudioSessionService.GetActiveSessions(EDataFlow.eRender, outputDeviceMap);
+        var inputSessions = AudioSessionService.GetActiveSessions(EDataFlow.eCapture, inputDeviceMap);
+        var sessions = MergeSessions(outputSessions, inputSessions);
+
+        return new PanelSnapshot(devices, sessions);
+    }
+
+    private void ApplyPanelSnapshot(PanelSnapshot snapshot)
+    {
+        if (snapshot.Sessions.Count == 0)
+        {
+            RemoveInactiveCards(Array.Empty<string>());
+            ShowPlaceholder("当前没有活跃的音频会话。");
+            return;
+        }
+
+        var desiredCards = new List<SessionCardControl>(snapshot.Sessions.Count);
+        var activeKeys = new List<string>(snapshot.Sessions.Count);
+
+        foreach (var session in snapshot.Sessions)
+        {
+            activeKeys.Add(session.SessionKey);
+
+            if (!sessionCards.TryGetValue(session.SessionKey, out var card))
+            {
+                card = new SessionCardControl(session, snapshot.Devices);
+                card.DeviceChanged += OnDeviceChanged;
+                card.VolumeChanged += OnVolumeChanged;
+                card.InteractionStateChanged += OnInteractionStateChanged;
+                sessionCards.Add(session.SessionKey, card);
+            }
+            else
+            {
+                card.UpdateSession(session, snapshot.Devices);
+            }
+
+            desiredCards.Add(card);
+        }
+
+        RemoveInactiveCards(activeKeys);
+        ReplaceSessionHostChildren(desiredCards);
+    }
+
+    private void ShowCachedSnapshotOrLoading()
+    {
+        if (lastSnapshot is not null)
+        {
+            ApplyPanelSnapshot(lastSnapshot);
+            return;
+        }
+
+        ShowPlaceholder("正在加载音频会话...");
     }
 
     private static IReadOnlyList<MixerAppSessionInfo> MergeSessions(
@@ -331,6 +376,11 @@ public sealed partial class MainWindow : Window
     {
         CancelDeactivateHide();
 
+        if (!isConfigured && hwnd == IntPtr.Zero)
+            Activate();
+
+        EnsureConfigured();
+
         if (!isConfigured || isExitRequested || isVisibilityTransitioning)
             return Task.CompletedTask;
 
@@ -341,6 +391,23 @@ public sealed partial class MainWindow : Window
         }
 
         return ShowPanelAsync();
+    }
+
+    private Task TogglePanelVisibilityAsync()
+    {
+        CancelDeactivateHide();
+
+        if (!isConfigured && hwnd == IntPtr.Zero)
+            Activate();
+
+        EnsureConfigured();
+
+        if (!isConfigured || isExitRequested || isVisibilityTransitioning)
+            return Task.CompletedTask;
+
+        return isPanelVisible
+            ? HideToTrayAsync()
+            : ShowPanelAsync();
     }
 
     public void PrepareForExit()
@@ -354,8 +421,10 @@ public sealed partial class MainWindow : Window
         foregroundMonitorTimer.Stop();
         refreshTimer.Stop();
         trayIconTimer.Stop();
+        refreshDispatcher.Dispose();
         DisposeTrayIcon();
         TrayVolumeIconService.Dispose();
+        AudioPolicyManager.Cleanup();
     }
 
     private async Task ShowPanelAsync()
@@ -369,7 +438,7 @@ public sealed partial class MainWindow : Window
 
         try
         {
-            RefreshData();
+            ShowCachedSnapshotOrLoading();
             refreshTimer.Start();
             UpdateWindowPosition();
 
@@ -392,6 +461,7 @@ public sealed partial class MainWindow : Window
             suppressHideUntil = DateTimeOffset.UtcNow + HideSuppressionDuration;
             allowDeactivateHide = true;
             foregroundMonitorTimer.Start();
+            RefreshData();
         }
         finally
         {
@@ -414,7 +484,14 @@ public sealed partial class MainWindow : Window
         try
         {
             var visual = ElementCompositionPreview.GetElementVisual(PanelSurface);
-            await AnimatePanelAsync(visual, Vector3.Zero, new Vector3(0f, 24f, 0f), 1f, 0f);
+            await AnimatePanelAsync(
+                visual,
+                Vector3.Zero,
+                new Vector3(0f, 24f, 0f),
+                1f,
+                0f,
+                PanelCloseOffsetAnimationDuration,
+                PanelCloseOpacityAnimationDuration);
             NativeMethods.SetWindowCloaked(hwnd, true);
             NativeMethods.ShowWindow(hwnd, NativeMethods.SwHide);
             isPanelVisible = false;
@@ -470,7 +547,14 @@ public sealed partial class MainWindow : Window
             deactivateHideTimer.Stop();
     }
 
-    private static Task AnimatePanelAsync(Visual visual, Vector3 fromOffset, Vector3 toOffset, float fromOpacity, float toOpacity)
+    private static Task AnimatePanelAsync(
+        Visual visual,
+        Vector3 fromOffset,
+        Vector3 toOffset,
+        float fromOpacity,
+        float toOpacity,
+        TimeSpan? offsetDuration = null,
+        TimeSpan? opacityDuration = null)
     {
         var compositor = visual.Compositor;
         var batch = compositor.CreateScopedBatch(CompositionBatchTypes.Animation);
@@ -483,12 +567,12 @@ public sealed partial class MainWindow : Window
         var offsetAnimation = compositor.CreateVector3KeyFrameAnimation();
         offsetAnimation.InsertKeyFrame(0f, fromOffset);
         offsetAnimation.InsertKeyFrame(1f, toOffset, easing);
-        offsetAnimation.Duration = TimeSpan.FromMilliseconds(240);
+        offsetAnimation.Duration = offsetDuration ?? PanelOpenOffsetAnimationDuration;
 
         var opacityAnimation = compositor.CreateScalarKeyFrameAnimation();
         opacityAnimation.InsertKeyFrame(0f, fromOpacity);
         opacityAnimation.InsertKeyFrame(1f, toOpacity, easing);
-        opacityAnimation.Duration = TimeSpan.FromMilliseconds(220);
+        opacityAnimation.Duration = opacityDuration ?? PanelOpenOpacityAnimationDuration;
 
         visual.StartAnimation(nameof(visual.Offset), offsetAnimation);
         visual.StartAnimation(nameof(visual.Opacity), opacityAnimation);
@@ -714,7 +798,7 @@ public sealed partial class MainWindow : Window
 
             lastPrimaryTrayInvokeAt = DateTimeOffset.UtcNow;
             CancelDeactivateHide();
-            _ = ShowOrBringToFrontAsync();
+            _ = TogglePanelVisibilityAsync();
 
             return;
         }
@@ -1244,6 +1328,8 @@ public sealed partial class MainWindow : Window
         Right,
         Top
     }
+
+    private sealed record PanelSnapshot(IReadOnlyList<AudioDevice> Devices, IReadOnlyList<MixerAppSessionInfo> Sessions);
 
     private delegate IntPtr WndProcDelegate(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 }

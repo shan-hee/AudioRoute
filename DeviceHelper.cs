@@ -118,28 +118,16 @@ public sealed class AudioDevice
 
 public static class DeviceEnumerator
 {
-    private static readonly object DeviceCacheSync = new();
-    private static readonly Dictionary<EDataFlow, CachedDevices> DeviceCache = new();
     private static readonly TimeSpan DeviceCacheDuration = TimeSpan.FromSeconds(2);
+    private static readonly ExpiringCache<EDataFlow, IReadOnlyList<AudioDevice>> DeviceCache = new(DeviceCacheDuration, 8);
 
     public static IReadOnlyList<AudioDevice> EnumerateDevices(EDataFlow flow = EDataFlow.eAll)
     {
-        var now = DateTimeOffset.UtcNow;
-
-        lock (DeviceCacheSync)
-        {
-            if (DeviceCache.TryGetValue(flow, out var cachedDevices) &&
-                cachedDevices.ExpiresAt > now)
-            {
-                return cachedDevices.Devices;
-            }
-        }
+        if (DeviceCache.TryGetValue(flow, out var cachedDevices))
+            return cachedDevices!;
 
         var devices = EnumerateDevicesCore(flow);
-
-        lock (DeviceCacheSync)
-            DeviceCache[flow] = new CachedDevices(devices, now + DeviceCacheDuration);
-
+        DeviceCache.Set(flow, devices);
         return devices;
     }
 
@@ -191,11 +179,25 @@ public static class DeviceEnumerator
                     var name = deviceId;
                     if (device.OpenPropertyStore(0, out var propertyStore) == 0)
                     {
-                        var key = PropertyKey.DeviceFriendlyName;
-                        if (propertyStore.GetValue(ref key, out var variant) == 0)
-                            name = variant.GetString() ?? deviceId;
-
-                        Marshal.ReleaseComObject(propertyStore);
+                        try
+                        {
+                            var key = PropertyKey.DeviceFriendlyName;
+                            if (propertyStore.GetValue(ref key, out var variant) == 0)
+                            {
+                                try
+                                {
+                                    name = variant.GetString() ?? deviceId;
+                                }
+                                finally
+                                {
+                                    _ = PropVariantClear(ref variant);
+                                }
+                            }
+                        }
+                        finally
+                        {
+                            Marshal.ReleaseComObject(propertyStore);
+                        }
                     }
 
                     var isDefault = currentFlow == EDataFlow.eRender
@@ -224,5 +226,6 @@ public static class DeviceEnumerator
         return devices.ToArray();
     }
 
-    private sealed record CachedDevices(IReadOnlyList<AudioDevice> Devices, DateTimeOffset ExpiresAt);
+    [DllImport("ole32.dll", ExactSpelling = true)]
+    private static extern int PropVariantClear(ref PropVariant propVariant);
 }

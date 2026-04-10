@@ -14,7 +14,9 @@ public partial class App : Application
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
         var showOnLaunch = !StartupManager.IsStartupLaunch(args.Arguments);
-        mainWindow = new MainWindow(showOnLaunch);
-        mainWindow.Activate();
+        mainWindow = new MainWindow();
+
+        if (showOnLaunch)
+            _ = mainWindow.ShowOrBringToFrontAsync();
     }
 }

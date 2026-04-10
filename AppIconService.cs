@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Threading.Tasks;
 using Microsoft.UI.Xaml.Media.Imaging;
@@ -10,10 +9,9 @@ namespace AudioRoute;
 
 public static class AppIconService
 {
-    private static readonly object IconCacheSync = new();
-    private static readonly Dictionary<IconCacheKey, CachedIconLoad> IconCache = new();
     private static readonly TimeSpan IconCacheDuration = TimeSpan.FromMinutes(10);
     private const int MaxIconCacheEntries = 128;
+    private static readonly ExpiringCache<IconCacheKey, Task<BitmapImage?>> IconCache = new(IconCacheDuration, MaxIconCacheEntries);
 
     public static Task<BitmapImage?> TryLoadIconAsync(string executablePath, uint size = 32)
     {
@@ -22,24 +20,12 @@ public static class AppIconService
 
         var normalizedPath = Path.GetFullPath(executablePath);
         var cacheKey = new IconCacheKey(normalizedPath, size);
-        var now = DateTimeOffset.UtcNow;
+        if (IconCache.TryGetValue(cacheKey, out var cachedIcon))
+            return cachedIcon!;
 
-        lock (IconCacheSync)
-        {
-            if (IconCache.TryGetValue(cacheKey, out var cachedIcon) &&
-                cachedIcon.ExpiresAt > now)
-            {
-                return cachedIcon.LoadTask;
-            }
-
-            var loadTask = LoadIconAsync(normalizedPath, size);
-            IconCache[cacheKey] = new CachedIconLoad(loadTask, now + IconCacheDuration);
-
-            if (IconCache.Count > MaxIconCacheEntries)
-                TrimExpiredIconCacheEntries(now);
-
-            return loadTask;
-        }
+        var loadTask = LoadIconAsync(normalizedPath, size);
+        IconCache.Set(cacheKey, loadTask);
+        return loadTask;
     }
 
     private static async Task<BitmapImage?> LoadIconAsync(string executablePath, uint size)
@@ -65,28 +51,5 @@ public static class AppIconService
         }
     }
 
-    private static void TrimExpiredIconCacheEntries(DateTimeOffset now)
-    {
-        var expiredKeys = new List<IconCacheKey>();
-
-        foreach (var entry in IconCache)
-        {
-            if (entry.Value.ExpiresAt <= now)
-                expiredKeys.Add(entry.Key);
-        }
-
-        foreach (var key in expiredKeys)
-            IconCache.Remove(key);
-
-        if (IconCache.Count <= MaxIconCacheEntries)
-            return;
-
-        using var enumerator = IconCache.Keys.GetEnumerator();
-        if (enumerator.MoveNext())
-            IconCache.Remove(enumerator.Current);
-    }
-
     private readonly record struct IconCacheKey(string ExecutablePath, uint Size);
-
-    private sealed record CachedIconLoad(Task<BitmapImage?> LoadTask, DateTimeOffset ExpiresAt);
 }
