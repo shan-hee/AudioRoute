@@ -29,6 +29,7 @@ public sealed partial class MainWindow : Window
     private static readonly TimeSpan SnapshotRefreshOnOpenAge = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan SnapshotRefreshWhileVisibleAge = TimeSpan.FromMinutes(3);
     private static readonly TimeSpan AudioChangeRefreshDebounceInterval = TimeSpan.FromMilliseconds(350);
+    private static readonly TimeSpan InitialSnapshotWarmupWait = TimeSpan.FromMilliseconds(160);
     private static readonly TimeSpan PanelOpenOffsetAnimationDuration = TimeSpan.FromMilliseconds(240);
     private static readonly TimeSpan PanelOpenOpacityAnimationDuration = TimeSpan.FromMilliseconds(220);
     private static readonly TimeSpan PanelCloseOffsetAnimationDuration = TimeSpan.FromMilliseconds(120);
@@ -55,6 +56,8 @@ public sealed partial class MainWindow : Window
     private bool isRefreshing;
     private bool isVisibilityTransitioning;
     private bool hasDeferredRefresh;
+    private bool deferredRefreshCanReuseDevices;
+    private RefreshSessionScope deferredRefreshScope = RefreshSessionScope.None;
     private bool isTrayIconCreated;
     private bool isSnapshotStale = true;
     private DateTimeOffset lastPrimaryTrayInvokeAt;
@@ -65,6 +68,9 @@ public sealed partial class MainWindow : Window
     private DateTimeOffset suppressHideUntil;
     private int interactionDepth;
     private int refreshGeneration;
+    private bool scheduledRefreshCanReuseDevices;
+    private RefreshSessionScope scheduledRefreshScope = RefreshSessionScope.None;
+    private Task? latestRefreshTask;
     private WinEventDelegate? foregroundEventDelegate;
     private IntPtr foregroundEventHook;
     private WndProcDelegate? windowProcDelegate;
@@ -113,15 +119,21 @@ public sealed partial class MainWindow : Window
         audioChangeRefreshTimer.Tick += (_, _) =>
         {
             audioChangeRefreshTimer.Stop();
+            var canReuseDevices = scheduledRefreshCanReuseDevices;
+            var scope = scheduledRefreshScope;
+            scheduledRefreshCanReuseDevices = false;
+            scheduledRefreshScope = RefreshSessionScope.None;
 
             if (!isExitRequested && (isPanelVisible || lastSnapshot is not null))
-                RefreshData();
+                RefreshData(canReuseDevices, scope);
         };
 
         audioChangeMonitor = new AudioChangeMonitor();
         audioChangeMonitor.Changed += OnAudioEnvironmentChanged;
+        audioChangeMonitor.SessionStructureChanged += OnObservedSessionStructureChanged;
         audioChangeMonitor.SessionVolumeChanged += OnObservedSessionVolumeChanged;
         audioChangeMonitor.MasterVolumeChanged += OnObservedMasterVolumeChanged;
+        audioChangeMonitor.SessionDisplayNameChanged += OnObservedSessionDisplayNameChanged;
 
         EnsureConfigured();
     }
@@ -167,6 +179,14 @@ public sealed partial class MainWindow : Window
         DispatcherQueue.TryEnqueue(HandleAudioEnvironmentChanged);
     }
 
+    private void OnObservedSessionStructureChanged(object? sender, ObservedSessionStructureChangedEventArgs e)
+    {
+        if (isExitRequested)
+            return;
+
+        DispatcherQueue.TryEnqueue(() => HandleObservedSessionStructureChanged(e));
+    }
+
     private void OnObservedSessionVolumeChanged(object? sender, ObservedSessionVolumeChangedEventArgs e)
     {
         if (isExitRequested)
@@ -183,6 +203,14 @@ public sealed partial class MainWindow : Window
         DispatcherQueue.TryEnqueue(() => HandleObservedMasterVolumeChanged(e));
     }
 
+    private void OnObservedSessionDisplayNameChanged(object? sender, ObservedSessionDisplayNameChangedEventArgs e)
+    {
+        if (isExitRequested)
+            return;
+
+        DispatcherQueue.TryEnqueue(() => HandleObservedSessionDisplayNameChanged(e));
+    }
+
     private void HandleAudioEnvironmentChanged()
     {
         if (isExitRequested)
@@ -193,8 +221,22 @@ public sealed partial class MainWindow : Window
         if (!isPanelVisible && lastSnapshot is null)
             return;
 
-        audioChangeRefreshTimer.Stop();
-        audioChangeRefreshTimer.Start();
+        ScheduleAudioRefresh(canReuseDevices: false, scope: RefreshSessionScope.All);
+    }
+
+    private void HandleObservedSessionStructureChanged(ObservedSessionStructureChangedEventArgs e)
+    {
+        if (isExitRequested)
+            return;
+
+        isSnapshotStale = true;
+
+        if (!isPanelVisible && lastSnapshot is null)
+            return;
+
+        ScheduleAudioRefresh(
+            canReuseDevices: lastSnapshot is not null,
+            scope: GetRefreshScope(e.Flow));
     }
 
     private void HandleObservedSessionVolumeChanged(ObservedSessionVolumeChangedEventArgs e)
@@ -219,45 +261,123 @@ public sealed partial class MainWindow : Window
         UpdateTrayIcon(e.State);
     }
 
-    private void RefreshData()
+    private void HandleObservedSessionDisplayNameChanged(ObservedSessionDisplayNameChangedEventArgs e)
     {
         if (isExitRequested)
+            return;
+
+        if (string.IsNullOrWhiteSpace(e.DisplayName))
+        {
+            isSnapshotStale = true;
+
+            if (!isPanelVisible && lastSnapshot is null)
+                return;
+
+            ScheduleAudioRefresh(
+                canReuseDevices: lastSnapshot is not null,
+                scope: GetRefreshScope(e.Flow));
+            return;
+        }
+
+        if (!TryUpdateCachedSessionDisplayName(e.SessionKey, e.Flow, e.DisplayName, out var updatedAppSession))
+            return;
+
+        if (!isPanelVisible || lastSnapshot is null || updatedAppSession is null)
+            return;
+
+        if (sessionCards.TryGetValue(e.SessionKey, out var card))
+            card.UpdateSession(updatedAppSession, lastSnapshot.Devices);
+
+        ReorderSessionCardsFromSnapshot();
+    }
+
+    private void ScheduleAudioRefresh(bool canReuseDevices, RefreshSessionScope scope = RefreshSessionScope.All)
+    {
+        scope &= RefreshSessionScope.All;
+        if (scope == RefreshSessionScope.None)
+            return;
+
+        if (!audioChangeRefreshTimer.IsRunning)
+        {
+            scheduledRefreshCanReuseDevices = canReuseDevices;
+            scheduledRefreshScope = scope;
+        }
+        else
+        {
+            scheduledRefreshCanReuseDevices &= canReuseDevices;
+            scheduledRefreshScope |= scope;
+        }
+
+        audioChangeRefreshTimer.Stop();
+        audioChangeRefreshTimer.Start();
+    }
+
+    private void RefreshData(bool canReuseDevices = false, RefreshSessionScope scope = RefreshSessionScope.All)
+    {
+        if (isExitRequested)
+            return;
+
+        scope &= RefreshSessionScope.All;
+        if (scope == RefreshSessionScope.None)
             return;
 
         EnsureConfigured();
 
         if (isRefreshing)
         {
+            deferredRefreshCanReuseDevices = hasDeferredRefresh
+                ? deferredRefreshCanReuseDevices && canReuseDevices
+                : canReuseDevices;
+            deferredRefreshScope = hasDeferredRefresh
+                ? deferredRefreshScope | scope
+                : scope;
             hasDeferredRefresh = true;
             return;
         }
 
         if (interactionDepth > 0)
         {
+            deferredRefreshCanReuseDevices = hasDeferredRefresh
+                ? deferredRefreshCanReuseDevices && canReuseDevices
+                : canReuseDevices;
+            deferredRefreshScope = hasDeferredRefresh
+                ? deferredRefreshScope | scope
+                : scope;
             hasDeferredRefresh = true;
             return;
         }
 
         hasDeferredRefresh = false;
+        deferredRefreshCanReuseDevices = false;
+        deferredRefreshScope = RefreshSessionScope.None;
         isRefreshing = true;
         var refreshVersion = ++refreshGeneration;
-        _ = RefreshDataAsync(refreshVersion);
+        var cachedSnapshot = lastSnapshot;
+        var cachedDevices = canReuseDevices ? cachedSnapshot?.Devices : null;
+        var refreshTask = RefreshDataAsync(refreshVersion, cachedSnapshot, cachedDevices, scope);
+        latestRefreshTask = refreshTask;
+        _ = refreshTask;
     }
 
-    private async Task RefreshDataAsync(int refreshVersion)
+    private async Task RefreshDataAsync(
+        int refreshVersion,
+        PanelSnapshot? cachedSnapshot,
+        IReadOnlyList<AudioDevice>? cachedDevices,
+        RefreshSessionScope scope)
     {
         try
         {
-            var snapshot = await refreshDispatcher.InvokeAsync(BuildPanelSnapshot);
+            var snapshot = await refreshDispatcher.InvokeAsync(() => BuildPanelSnapshot(cachedSnapshot, cachedDevices, scope));
             if (isExitRequested || refreshVersion != refreshGeneration)
                 return;
 
+            var previousSnapshot = lastSnapshot;
             lastSnapshot = snapshot;
             lastSnapshotUpdatedAt = DateTimeOffset.UtcNow;
             isSnapshotStale = false;
 
             if (isPanelVisible)
-                ApplyPanelSnapshot(snapshot);
+                ApplyPanelSnapshot(snapshot, previousSnapshot);
         }
         catch when (isExitRequested)
         {
@@ -275,8 +395,12 @@ public sealed partial class MainWindow : Window
 
             if (hasDeferredRefresh && interactionDepth == 0 && !isExitRequested)
             {
+                var canReuseDevices = deferredRefreshCanReuseDevices;
+                var deferredScope = deferredRefreshScope;
                 hasDeferredRefresh = false;
-                RefreshData();
+                deferredRefreshCanReuseDevices = false;
+                deferredRefreshScope = RefreshSessionScope.None;
+                RefreshData(canReuseDevices, deferredScope);
             }
         }
     }
@@ -311,19 +435,52 @@ public sealed partial class MainWindow : Window
         };
     }
 
-    private static PanelSnapshot BuildPanelSnapshot()
+    private static PanelSnapshot BuildPanelSnapshot(
+        PanelSnapshot? cachedSnapshot,
+        IReadOnlyList<AudioDevice>? devices = null,
+        RefreshSessionScope scope = RefreshSessionScope.All)
     {
-        var devices = DeviceEnumerator.EnumerateDevices(EDataFlow.eAll);
-        var outputDeviceMap = CreateDeviceMap(devices, EDataFlow.eRender);
-        var inputDeviceMap = CreateDeviceMap(devices, EDataFlow.eCapture);
-        var outputSessions = AudioSessionService.GetActiveSessions(EDataFlow.eRender, outputDeviceMap);
-        var inputSessions = AudioSessionService.GetActiveSessions(EDataFlow.eCapture, inputDeviceMap);
+        scope &= RefreshSessionScope.All;
+        if (scope == RefreshSessionScope.None || cachedSnapshot is null)
+            scope = RefreshSessionScope.All;
+
+        devices ??= DeviceEnumerator.EnumerateDevices(EDataFlow.eAll);
+        var outputSessions = (scope & RefreshSessionScope.Render) != 0
+            ? AudioSessionService.GetActiveSessions(EDataFlow.eRender, CreateDeviceMap(devices, EDataFlow.eRender))
+            : GetSessionsForFlow(cachedSnapshot!, EDataFlow.eRender);
+        var inputSessions = (scope & RefreshSessionScope.Capture) != 0
+            ? AudioSessionService.GetActiveSessions(EDataFlow.eCapture, CreateDeviceMap(devices, EDataFlow.eCapture))
+            : GetSessionsForFlow(cachedSnapshot!, EDataFlow.eCapture);
         var sessions = MergeSessions(outputSessions, inputSessions);
 
         return new PanelSnapshot(devices, sessions);
     }
 
-    private void ApplyPanelSnapshot(PanelSnapshot snapshot)
+    private static IReadOnlyList<MixerSessionInfo> GetSessionsForFlow(PanelSnapshot snapshot, EDataFlow flow)
+    {
+        var sessions = new List<MixerSessionInfo>(snapshot.Sessions.Count);
+
+        foreach (var appSession in snapshot.Sessions)
+        {
+            var session = appSession.GetSession(flow);
+            if (session is not null)
+                sessions.Add(session);
+        }
+
+        return sessions;
+    }
+
+    private static RefreshSessionScope GetRefreshScope(EDataFlow flow)
+    {
+        return flow switch
+        {
+            EDataFlow.eRender => RefreshSessionScope.Render,
+            EDataFlow.eCapture => RefreshSessionScope.Capture,
+            _ => RefreshSessionScope.All
+        };
+    }
+
+    private void ApplyPanelSnapshot(PanelSnapshot snapshot, PanelSnapshot? previousSnapshot = null)
     {
         if (snapshot.Sessions.Count == 0)
         {
@@ -332,6 +489,8 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        var previousSessionMap = previousSnapshot?.Sessions.ToDictionary(session => session.SessionKey, StringComparer.OrdinalIgnoreCase);
+        var devicesChanged = !AreDevicesEquivalent(previousSnapshot?.Devices, snapshot.Devices);
         var desiredCards = new List<SessionCardControl>(snapshot.Sessions.Count);
         var activeKeys = new List<string>(snapshot.Sessions.Count);
 
@@ -349,7 +508,13 @@ public sealed partial class MainWindow : Window
             }
             else
             {
-                card.UpdateSession(session, snapshot.Devices);
+                var needsUpdate = devicesChanged ||
+                    previousSessionMap is null ||
+                    !previousSessionMap.TryGetValue(session.SessionKey, out var previousSession) ||
+                    !AreAppSessionsEquivalent(previousSession, session);
+
+                if (needsUpdate)
+                    card.UpdateSession(session, snapshot.Devices);
             }
 
             desiredCards.Add(card);
@@ -363,11 +528,37 @@ public sealed partial class MainWindow : Window
     {
         if (lastSnapshot is not null)
         {
-            ApplyPanelSnapshot(lastSnapshot);
+            ApplyPanelSnapshot(lastSnapshot, lastSnapshot);
             return;
         }
 
         ShowPlaceholder("正在加载音频会话...");
+    }
+
+    private async Task WaitForInitialSnapshotWarmupAsync()
+    {
+        if (lastSnapshot is not null || !isRefreshing)
+            return;
+
+        var refreshTask = latestRefreshTask;
+        if (refreshTask is null || refreshTask.IsCompleted)
+            return;
+
+        try
+        {
+            await Task.WhenAny(refreshTask, Task.Delay(InitialSnapshotWarmupWait));
+        }
+        catch when (isExitRequested)
+        {
+        }
+    }
+
+    private static IReadOnlyList<MixerAppSessionInfo> OrderSessions(IEnumerable<MixerAppSessionInfo> sessions)
+    {
+        return sessions
+            .OrderBy(session => session.IsSystemSession ? 0 : 1)
+            .ThenBy(session => session.DisplayName, StringComparer.CurrentCultureIgnoreCase)
+            .ToList();
     }
 
     private void RefreshDataIfNeeded(TimeSpan maxSnapshotAge)
@@ -402,7 +593,7 @@ public sealed partial class MainWindow : Window
             groupedSessions[session.SessionKey] = pair;
         }
 
-        return groupedSessions
+        return OrderSessions(groupedSessions
             .Values
             .Select(pair =>
             {
@@ -416,10 +607,7 @@ public sealed partial class MainWindow : Window
                     OutputSession = pair.Output,
                     InputSession = pair.Input
                 };
-            })
-            .OrderBy(session => session.IsSystemSession ? 0 : 1)
-            .ThenBy(session => session.DisplayName, StringComparer.CurrentCultureIgnoreCase)
-            .ToList();
+            }));
     }
 
     private void OnDeviceChanged(object? sender, MixerDeviceChangedEventArgs e)
@@ -444,15 +632,13 @@ public sealed partial class MainWindow : Window
             isSnapshotStale = true;
 
             if (isPanelVisible)
-            {
-                audioChangeRefreshTimer.Stop();
-                audioChangeRefreshTimer.Start();
-            }
+                ScheduleAudioRefresh(canReuseDevices: true, scope: GetRefreshScope(e.Session.Flow));
         }
         catch (Exception ex)
         {
             Trace.WriteLine($"[AudioRoute] 更改设备失败: {ex}");
             hasDeferredRefresh = true;
+            deferredRefreshCanReuseDevices = false;
             RefreshData();
             ShowError($"更改设备失败: {ex.Message}");
         }
@@ -462,7 +648,9 @@ public sealed partial class MainWindow : Window
     {
         try
         {
-            AudioSessionService.SetSessionVolume(e.Session.SessionKey, e.Session.Flow, e.Volume);
+            if (!audioChangeMonitor.TrySetSessionVolume(e.Session.SessionKey, e.Session.Flow, e.Volume))
+                AudioSessionService.SetSessionVolume(e.Session.SessionKey, e.Session.Flow, e.Volume);
+
             UpdateCachedSessionVolume(e.Session.SessionKey, e.Session.Flow, e.Volume, isMuted: e.Volume <= 0.005f);
         }
         catch (Exception ex)
@@ -485,8 +673,12 @@ public sealed partial class MainWindow : Window
 
         if (interactionDepth == 0 && hasDeferredRefresh)
         {
-            audioChangeRefreshTimer.Stop();
-            audioChangeRefreshTimer.Start();
+            var canReuseDevices = deferredRefreshCanReuseDevices;
+            var scope = deferredRefreshScope;
+            hasDeferredRefresh = false;
+            deferredRefreshCanReuseDevices = false;
+            deferredRefreshScope = RefreshSessionScope.None;
+            ScheduleAudioRefresh(canReuseDevices, scope);
         }
     }
 
@@ -541,8 +733,10 @@ public sealed partial class MainWindow : Window
         audioChangeRefreshTimer.Stop();
         DetachForegroundEventHook();
         audioChangeMonitor.Changed -= OnAudioEnvironmentChanged;
+        audioChangeMonitor.SessionStructureChanged -= OnObservedSessionStructureChanged;
         audioChangeMonitor.SessionVolumeChanged -= OnObservedSessionVolumeChanged;
         audioChangeMonitor.MasterVolumeChanged -= OnObservedMasterVolumeChanged;
+        audioChangeMonitor.SessionDisplayNameChanged -= OnObservedSessionDisplayNameChanged;
         audioChangeMonitor.Dispose();
         refreshDispatcher.Dispose();
         DisposeTrayIcon();
@@ -561,6 +755,10 @@ public sealed partial class MainWindow : Window
 
         try
         {
+            await WaitForInitialSnapshotWarmupAsync();
+            if (isExitRequested || isPanelVisible)
+                return;
+
             ShowCachedSnapshotOrLoading();
             refreshTimer.Start();
             UpdateWindowPosition();
@@ -999,6 +1197,59 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private bool TryUpdateCachedSessionDisplayName(
+        string sessionKey,
+        EDataFlow flow,
+        string displayName,
+        out MixerAppSessionInfo? updatedAppSession)
+    {
+        updatedAppSession = null;
+
+        if (lastSnapshot is null)
+            return false;
+
+        var changed = false;
+        var updatedSessions = new List<MixerAppSessionInfo>(lastSnapshot.Sessions.Count);
+
+        foreach (var appSession in lastSnapshot.Sessions)
+        {
+            if (!string.Equals(appSession.SessionKey, sessionKey, StringComparison.OrdinalIgnoreCase))
+            {
+                updatedSessions.Add(appSession);
+                continue;
+            }
+
+            var session = appSession.GetSession(flow);
+            if (session is null || string.Equals(session.DisplayName, displayName, StringComparison.Ordinal))
+            {
+                updatedSessions.Add(appSession);
+                continue;
+            }
+
+            var updatedSession = CloneSessionWithDisplayName(session, displayName);
+            var outputSession = flow == EDataFlow.eRender ? updatedSession : appSession.OutputSession;
+            var inputSession = flow == EDataFlow.eCapture ? updatedSession : appSession.InputSession;
+
+            updatedAppSession = new MixerAppSessionInfo
+            {
+                SessionKey = appSession.SessionKey,
+                PrimarySession = outputSession ?? inputSession ?? updatedSession,
+                OutputSession = outputSession,
+                InputSession = inputSession
+            };
+
+            updatedSessions.Add(updatedAppSession);
+            changed = true;
+        }
+
+        if (!changed)
+            return false;
+
+        lastSnapshot = lastSnapshot with { Sessions = OrderSessions(updatedSessions) };
+        lastSnapshotUpdatedAt = DateTimeOffset.UtcNow;
+        return true;
+    }
+
     private static MixerSessionInfo CloneSessionWithVolume(MixerSessionInfo session, float volume, bool isMuted)
     {
         return new MixerSessionInfo
@@ -1039,6 +1290,97 @@ public sealed partial class MainWindow : Window
             IsSystemSession = session.IsSystemSession,
             IsRoutingSupported = session.IsRoutingSupported
         };
+    }
+
+    private static MixerSessionInfo CloneSessionWithDisplayName(MixerSessionInfo session, string displayName)
+    {
+        return new MixerSessionInfo
+        {
+            SessionKey = session.SessionKey,
+            DisplayName = displayName,
+            ActualDeviceSummary = session.ActualDeviceSummary,
+            BoundDeviceSummary = session.BoundDeviceSummary,
+            ProcessName = session.ProcessName,
+            ExecutablePath = session.ExecutablePath,
+            BoundDeviceId = session.BoundDeviceId,
+            RoutingUnavailableReason = session.RoutingUnavailableReason,
+            Flow = session.Flow,
+            ProcessId = session.ProcessId,
+            Volume = session.Volume,
+            IsMuted = session.IsMuted,
+            IsSystemSession = session.IsSystemSession,
+            IsRoutingSupported = session.IsRoutingSupported
+        };
+    }
+
+    private static bool AreDevicesEquivalent(IReadOnlyList<AudioDevice>? left, IReadOnlyList<AudioDevice>? right)
+    {
+        if (ReferenceEquals(left, right))
+            return true;
+
+        if (left is null || right is null || left.Count != right.Count)
+            return false;
+
+        for (var index = 0; index < left.Count; index++)
+        {
+            var leftDevice = left[index];
+            var rightDevice = right[index];
+            if (!string.Equals(leftDevice.Id, rightDevice.Id, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(leftDevice.Name, rightDevice.Name, StringComparison.Ordinal) ||
+                leftDevice.Flow != rightDevice.Flow ||
+                leftDevice.IsDefault != rightDevice.IsDefault)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool AreAppSessionsEquivalent(MixerAppSessionInfo left, MixerAppSessionInfo right)
+    {
+        return string.Equals(left.SessionKey, right.SessionKey, StringComparison.OrdinalIgnoreCase) &&
+            AreSessionEquivalent(left.OutputSession, right.OutputSession) &&
+            AreSessionEquivalent(left.InputSession, right.InputSession);
+    }
+
+    private static bool AreSessionEquivalent(MixerSessionInfo? left, MixerSessionInfo? right)
+    {
+        if (ReferenceEquals(left, right))
+            return true;
+
+        if (left is null || right is null)
+            return false;
+
+        return string.Equals(left.SessionKey, right.SessionKey, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(left.DisplayName, right.DisplayName, StringComparison.Ordinal) &&
+            string.Equals(left.ActualDeviceSummary, right.ActualDeviceSummary, StringComparison.Ordinal) &&
+            string.Equals(left.BoundDeviceSummary, right.BoundDeviceSummary, StringComparison.Ordinal) &&
+            string.Equals(left.ProcessName, right.ProcessName, StringComparison.Ordinal) &&
+            string.Equals(left.ExecutablePath, right.ExecutablePath, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(left.BoundDeviceId, right.BoundDeviceId, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(left.RoutingUnavailableReason, right.RoutingUnavailableReason, StringComparison.Ordinal) &&
+            left.Flow == right.Flow &&
+            left.ProcessId == right.ProcessId &&
+            Math.Abs(left.Volume - right.Volume) < 0.001f &&
+            left.IsMuted == right.IsMuted &&
+            left.IsSystemSession == right.IsSystemSession &&
+            left.IsRoutingSupported == right.IsRoutingSupported;
+    }
+
+    private void ReorderSessionCardsFromSnapshot()
+    {
+        if (lastSnapshot is null)
+            return;
+
+        var desiredCards = new List<SessionCardControl>(lastSnapshot.Sessions.Count);
+        foreach (var session in lastSnapshot.Sessions)
+        {
+            if (sessionCards.TryGetValue(session.SessionKey, out var card))
+                desiredCards.Add(card);
+        }
+
+        ReplaceSessionHostChildren(desiredCards);
     }
 
     private IntPtr WindowProc(IntPtr windowHandle, uint message, IntPtr wParam, IntPtr lParam)
@@ -1388,26 +1730,56 @@ public sealed partial class MainWindow : Window
 
     private void ReplaceSessionHostChildren(IReadOnlyList<SessionCardControl> desiredCards)
     {
-        var needsUpdate = SessionHost.Children.Count != desiredCards.Count;
-
-        if (!needsUpdate)
+        if (SessionHost.Children.Count == 0)
         {
-            for (var index = 0; index < desiredCards.Count; index++)
+            foreach (var card in desiredCards)
+                SessionHost.Children.Add(card);
+
+            return;
+        }
+
+        if (SessionHost.Children.OfType<UIElement>().Any(child => child is not SessionCardControl))
+            SessionHost.Children.Clear();
+
+        var desiredLookup = new HashSet<SessionCardControl>(desiredCards);
+
+        for (var index = SessionHost.Children.Count - 1; index >= 0; index--)
+        {
+            if (SessionHost.Children[index] is not SessionCardControl existingCard || !desiredLookup.Contains(existingCard))
+                SessionHost.Children.RemoveAt(index);
+        }
+
+        for (var index = 0; index < desiredCards.Count; index++)
+        {
+            var desiredCard = desiredCards[index];
+            if (index < SessionHost.Children.Count && ReferenceEquals(SessionHost.Children[index], desiredCard))
+                continue;
+
+            var existingIndex = FindSessionHostChildIndex(desiredCard);
+            if (existingIndex >= 0)
             {
-                if (!ReferenceEquals(SessionHost.Children[index], desiredCards[index]))
-                {
-                    needsUpdate = true;
-                    break;
-                }
+                SessionHost.Children.RemoveAt(existingIndex);
+                SessionHost.Children.Insert(index, desiredCard);
+            }
+            else
+            {
+                SessionHost.Children.Insert(index, desiredCard);
             }
         }
 
-        if (!needsUpdate)
-            return;
+        while (SessionHost.Children.Count > desiredCards.Count)
+            SessionHost.Children.RemoveAt(SessionHost.Children.Count - 1);
+    }
 
-        SessionHost.Children.Clear();
-        foreach (var card in desiredCards)
-            SessionHost.Children.Add(card);
+    private int FindSessionHostChildIndex(SessionCardControl card)
+    {
+        for (var index = 0; index < SessionHost.Children.Count; index++)
+        {
+            if (ReferenceEquals(SessionHost.Children[index], card))
+                return index;
+        }
+
+        return -1;
     }
 
     private static class NativeMethods
@@ -1661,6 +2033,15 @@ public sealed partial class MainWindow : Window
         Left,
         Right,
         Top
+    }
+
+    [Flags]
+    private enum RefreshSessionScope
+    {
+        None = 0,
+        Render = 1,
+        Capture = 2,
+        All = Render | Capture
     }
 
     private sealed record PanelSnapshot(IReadOnlyList<AudioDevice> Devices, IReadOnlyList<MixerAppSessionInfo> Sessions);

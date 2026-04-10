@@ -39,6 +39,32 @@ internal sealed class ObservedMasterVolumeChangedEventArgs : EventArgs
     public MasterVolumeState? State { get; }
 }
 
+internal sealed class ObservedSessionDisplayNameChangedEventArgs : EventArgs
+{
+    public ObservedSessionDisplayNameChangedEventArgs(string sessionKey, EDataFlow flow, string? displayName)
+    {
+        SessionKey = sessionKey;
+        Flow = flow;
+        DisplayName = displayName;
+    }
+
+    public string SessionKey { get; }
+
+    public EDataFlow Flow { get; }
+
+    public string? DisplayName { get; }
+}
+
+internal sealed class ObservedSessionStructureChangedEventArgs : EventArgs
+{
+    public ObservedSessionStructureChangedEventArgs(EDataFlow flow)
+    {
+        Flow = flow;
+    }
+
+    public EDataFlow Flow { get; }
+}
+
 internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
 {
     private readonly object syncRoot = new();
@@ -59,6 +85,61 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
     public event EventHandler<ObservedSessionVolumeChangedEventArgs>? SessionVolumeChanged;
 
     public event EventHandler<ObservedMasterVolumeChangedEventArgs>? MasterVolumeChanged;
+
+    public event EventHandler<ObservedSessionDisplayNameChangedEventArgs>? SessionDisplayNameChanged;
+
+    public event EventHandler<ObservedSessionStructureChangedEventArgs>? SessionStructureChanged;
+
+    public bool TrySetSessionVolume(string sessionKey, EDataFlow flow, float volume)
+    {
+        if (disposed)
+            return false;
+
+        List<SessionRegistration>? matchingRegistrations = null;
+        var clampedVolume = Math.Clamp(volume, 0f, 1f);
+
+        lock (syncRoot)
+        {
+            foreach (var registration in sessionRegistrations.Values)
+            {
+                if (registration.Flow != flow ||
+                    !string.Equals(registration.SessionKey, sessionKey, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                matchingRegistrations ??= new List<SessionRegistration>();
+                matchingRegistrations.Add(registration);
+            }
+        }
+
+        if (matchingRegistrations is null || matchingRegistrations.Count == 0)
+            return false;
+
+        var updated = false;
+        foreach (var registration in matchingRegistrations)
+        {
+            try
+            {
+                var simpleAudioVolume = registration.Session.SimpleAudioVolume;
+                try
+                {
+                    simpleAudioVolume.Volume = clampedVolume;
+                    updated = true;
+                }
+                finally
+                {
+                    simpleAudioVolume.Dispose();
+                }
+            }
+            catch (Exception ex)
+            {
+                Trace.WriteLine($"[AudioRoute] Failed to set tracked session volume: key={sessionKey}, flow={flow}, {ex}");
+            }
+        }
+
+        return updated;
+    }
 
     public void Dispose()
     {
@@ -236,13 +317,13 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
 
         var sessionKey = GetAppSessionKey(session);
         var handler = new SessionEventsHandler(
-            onSessionStateChanged: state => HandleSessionStateChanged(sessionId, state),
-            onSessionDisconnected: () => RemoveSessionAndRaise(sessionId),
-            onMetadataChanged: RaiseChanged,
+            onSessionStateChanged: state => HandleSessionStateChanged(sessionId, flow, state),
+            onSessionDisconnected: () => RemoveSessionAndRaiseStructureChanged(sessionId, flow),
+            onDisplayNameChanged: displayName => HandleSessionDisplayNameChanged(sessionKey, flow, displayName),
             onVolumeChanged: (volume, isMuted) => HandleSessionVolumeChanged(sessionKey, flow, volume, isMuted));
 
         session.RegisterEventClient(handler);
-        sessionRegistrations.Add(sessionId, new SessionRegistration(sessionId, session, handler));
+        sessionRegistrations.Add(sessionId, new SessionRegistration(sessionId, sessionKey, flow, session, handler));
         return true;
     }
 
@@ -275,18 +356,13 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         }
 
         if (shouldRaise)
-            RaiseChanged();
+            RaiseSessionStructureChanged(flow);
     }
 
-    private void HandleSessionStateChanged(string sessionId, NAudioAudioSessionState state)
+    private void HandleSessionStateChanged(string sessionId, EDataFlow flow, NAudioAudioSessionState state)
     {
         if (state == NAudioAudioSessionState.AudioSessionStateExpired)
-        {
-            RemoveSessionAndRaise(sessionId);
-            return;
-        }
-
-        RaiseChanged();
+            RemoveSessionAndRaiseStructureChanged(sessionId, flow);
     }
 
     private void HandleSessionVolumeChanged(string sessionKey, EDataFlow flow, float volume, bool isMuted)
@@ -297,6 +373,14 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         SessionVolumeChanged?.Invoke(this, new ObservedSessionVolumeChangedEventArgs(sessionKey, flow, volume, isMuted));
     }
 
+    private void HandleSessionDisplayNameChanged(string sessionKey, EDataFlow flow, string? displayName)
+    {
+        if (disposed)
+            return;
+
+        SessionDisplayNameChanged?.Invoke(this, new ObservedSessionDisplayNameChangedEventArgs(sessionKey, flow, displayName));
+    }
+
     private void HandleMasterVolumeNotification(float volume, bool isMuted)
     {
         if (disposed)
@@ -305,12 +389,12 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         RaiseMasterVolumeChanged(MasterVolumeService.CreateState(volume, isMuted));
     }
 
-    private void RemoveSessionAndRaise(string sessionId)
+    private void RemoveSessionAndRaiseStructureChanged(string sessionId, EDataFlow flow)
     {
         lock (syncRoot)
             RemoveSessionCore(sessionId);
 
-        RaiseChanged();
+        RaiseSessionStructureChanged(flow);
     }
 
     private void RemoveSessionCore(string sessionId)
@@ -351,6 +435,14 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
             return;
 
         MasterVolumeChanged?.Invoke(this, new ObservedMasterVolumeChangedEventArgs(state));
+    }
+
+    private void RaiseSessionStructureChanged(EDataFlow flow)
+    {
+        if (disposed)
+            return;
+
+        SessionStructureChanged?.Invoke(this, new ObservedSessionStructureChangedEventArgs(flow));
     }
 
     private static string GetSessionIdentity(AudioSessionControl session)
@@ -433,14 +525,20 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
 
     private sealed class SessionRegistration : IDisposable
     {
-        public SessionRegistration(string sessionId, AudioSessionControl session, SessionEventsHandler handler)
+        public SessionRegistration(string sessionId, string sessionKey, EDataFlow flow, AudioSessionControl session, SessionEventsHandler handler)
         {
             SessionId = sessionId;
+            SessionKey = sessionKey;
+            Flow = flow;
             Session = session;
             Handler = handler;
         }
 
         public string SessionId { get; }
+
+        public string SessionKey { get; }
+
+        public EDataFlow Flow { get; }
 
         public AudioSessionControl Session { get; }
 
@@ -499,29 +597,28 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
     {
         private readonly Action<NAudioAudioSessionState> onSessionStateChanged;
         private readonly Action onSessionDisconnected;
-        private readonly Action onMetadataChanged;
+        private readonly Action<string?> onDisplayNameChanged;
         private readonly Action<float, bool> onVolumeChanged;
 
         public SessionEventsHandler(
             Action<NAudioAudioSessionState> onSessionStateChanged,
             Action onSessionDisconnected,
-            Action onMetadataChanged,
+            Action<string?> onDisplayNameChanged,
             Action<float, bool> onVolumeChanged)
         {
             this.onSessionStateChanged = onSessionStateChanged;
             this.onSessionDisconnected = onSessionDisconnected;
-            this.onMetadataChanged = onMetadataChanged;
+            this.onDisplayNameChanged = onDisplayNameChanged;
             this.onVolumeChanged = onVolumeChanged;
         }
 
         public void OnDisplayNameChanged(string displayName)
         {
-            onMetadataChanged();
+            onDisplayNameChanged(displayName);
         }
 
         public void OnIconPathChanged(string iconPath)
         {
-            onMetadataChanged();
         }
 
         public void OnVolumeChanged(float volume, bool isMuted)
@@ -535,7 +632,6 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
 
         public void OnGroupingParamChanged(ref Guid groupingId)
         {
-            onMetadataChanged();
         }
 
         public void OnStateChanged(NAudioAudioSessionState state)
