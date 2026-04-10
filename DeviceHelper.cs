@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 namespace AudioRoute;
@@ -102,12 +103,6 @@ internal interface IMMDeviceCollection
     int Item(uint nDevice, out IMMDevice ppDevice);
 }
 
-[ComImport]
-[Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
-internal class MMDeviceEnumeratorComObject
-{
-}
-
 public sealed class AudioDevice
 {
     public string Id { get; init; } = string.Empty;
@@ -118,6 +113,7 @@ public sealed class AudioDevice
 
 public static class DeviceEnumerator
 {
+    private static readonly Guid MMDeviceEnumeratorClassId = new("BCDE0395-E52F-467C-8E3D-C4579291692E");
     private static readonly TimeSpan DeviceCacheDuration = TimeSpan.FromSeconds(2);
     private static readonly ExpiringCache<EDataFlow, IReadOnlyList<AudioDevice>> DeviceCache = new(DeviceCacheDuration, 8);
 
@@ -131,10 +127,22 @@ public static class DeviceEnumerator
         return devices;
     }
 
+    public static void InvalidateCache(EDataFlow flow = EDataFlow.eAll)
+    {
+        if (flow == EDataFlow.eAll)
+        {
+            DeviceCache.Clear();
+            return;
+        }
+
+        DeviceCache.Remove(flow);
+        DeviceCache.Remove(EDataFlow.eAll);
+    }
+
     private static AudioDevice[] EnumerateDevicesCore(EDataFlow flow)
     {
         var devices = new List<AudioDevice>();
-        var enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorComObject();
+        var enumerator = CreateDeviceEnumerator();
 
         try
         {
@@ -144,15 +152,27 @@ public static class DeviceEnumerator
             if (flow is EDataFlow.eRender or EDataFlow.eAll &&
                 enumerator.GetDefaultAudioEndpoint(EDataFlow.eRender, ERole.eMultimedia, out var defaultRenderDevice) == 0)
             {
-                defaultRenderDevice.GetId(out defaultRenderDeviceId);
-                Marshal.ReleaseComObject(defaultRenderDevice);
+                try
+                {
+                    defaultRenderDevice.GetId(out defaultRenderDeviceId);
+                }
+                finally
+                {
+                    ReleaseComObject(defaultRenderDevice);
+                }
             }
 
             if (flow is EDataFlow.eCapture or EDataFlow.eAll &&
                 enumerator.GetDefaultAudioEndpoint(EDataFlow.eCapture, ERole.eMultimedia, out var defaultCaptureDevice) == 0)
             {
-                defaultCaptureDevice.GetId(out defaultCaptureDeviceId);
-                Marshal.ReleaseComObject(defaultCaptureDevice);
+                try
+                {
+                    defaultCaptureDevice.GetId(out defaultCaptureDeviceId);
+                }
+                finally
+                {
+                    ReleaseComObject(defaultCaptureDevice);
+                }
             }
 
             var flows = flow == EDataFlow.eAll
@@ -164,63 +184,78 @@ public static class DeviceEnumerator
                 if (enumerator.EnumAudioEndpoints(currentFlow, DeviceState.Active, out var collection) != 0)
                     continue;
 
-                collection.GetCount(out var count);
-                var requiredCapacity = devices.Count + (int)count;
-                if (devices.Capacity < requiredCapacity)
-                    devices.Capacity = requiredCapacity;
-
-                for (uint i = 0; i < count; i++)
+                try
                 {
-                    if (collection.Item(i, out var device) != 0)
-                        continue;
+                    collection.GetCount(out var count);
+                    var requiredCapacity = devices.Count + (int)count;
+                    if (devices.Capacity < requiredCapacity)
+                        devices.Capacity = requiredCapacity;
 
-                    device.GetId(out var deviceId);
-
-                    var name = deviceId;
-                    if (device.OpenPropertyStore(0, out var propertyStore) == 0)
+                    for (uint i = 0; i < count; i++)
                     {
+                        if (collection.Item(i, out var device) != 0)
+                            continue;
+
                         try
                         {
-                            var key = PropertyKey.DeviceFriendlyName;
-                            if (propertyStore.GetValue(ref key, out var variant) == 0)
+                            device.GetId(out var deviceId);
+
+                            var name = deviceId;
+                            if (device.OpenPropertyStore(0, out var propertyStore) == 0)
                             {
                                 try
                                 {
-                                    name = variant.GetString() ?? deviceId;
+                                    var key = PropertyKey.DeviceFriendlyName;
+                                    if (propertyStore.GetValue(ref key, out var variant) == 0)
+                                    {
+                                        try
+                                        {
+                                            name = variant.GetString() ?? deviceId;
+                                        }
+                                        finally
+                                        {
+                                            _ = PropVariantClear(ref variant);
+                                        }
+                                    }
                                 }
                                 finally
                                 {
-                                    _ = PropVariantClear(ref variant);
+                                    ReleaseComObject(propertyStore);
                                 }
                             }
+
+                            var isDefault = currentFlow == EDataFlow.eRender
+                                ? deviceId == defaultRenderDeviceId
+                                : deviceId == defaultCaptureDeviceId;
+
+                            devices.Add(new AudioDevice
+                            {
+                                Id = deviceId,
+                                Name = name,
+                                Flow = currentFlow,
+                                IsDefault = isDefault
+                            });
                         }
                         finally
                         {
-                            Marshal.ReleaseComObject(propertyStore);
+                            ReleaseComObject(device);
                         }
                     }
-
-                    var isDefault = currentFlow == EDataFlow.eRender
-                        ? deviceId == defaultRenderDeviceId
-                        : deviceId == defaultCaptureDeviceId;
-
-                    devices.Add(new AudioDevice
-                    {
-                        Id = deviceId,
-                        Name = name,
-                        Flow = currentFlow,
-                        IsDefault = isDefault
-                    });
-
-                    Marshal.ReleaseComObject(device);
                 }
-
-                Marshal.ReleaseComObject(collection);
+                finally
+                {
+                    ReleaseComObject(collection);
+                }
             }
+        }
+        catch (Exception ex)
+        {
+            Trace.WriteLine($"[AudioRoute] 枚举音频设备失败: {ex}");
+            throw;
         }
         finally
         {
-            Marshal.ReleaseComObject(enumerator);
+            ReleaseComObject(enumerator);
         }
 
         return devices.ToArray();
@@ -228,4 +263,21 @@ public static class DeviceEnumerator
 
     [DllImport("ole32.dll", ExactSpelling = true)]
     private static extern int PropVariantClear(ref PropVariant propVariant);
+
+    private static void ReleaseComObject(object? comObject)
+    {
+        if (comObject is not null && Marshal.IsComObject(comObject))
+            Marshal.ReleaseComObject(comObject);
+    }
+
+    private static IMMDeviceEnumerator CreateDeviceEnumerator()
+    {
+        var comType = Type.GetTypeFromCLSID(MMDeviceEnumeratorClassId)
+            ?? throw new InvalidOperationException("无法解析 MMDeviceEnumerator COM 类型。");
+
+        var instance = Activator.CreateInstance(comType)
+            ?? throw new InvalidOperationException("无法创建 MMDeviceEnumerator COM 实例。");
+
+        return (IMMDeviceEnumerator)instance;
+    }
 }

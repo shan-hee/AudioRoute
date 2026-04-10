@@ -77,6 +77,7 @@ public sealed partial class SessionCardControl : UserControl
         {
             null => label,
             _ when session.CanChangeDevice => $"{label} · {session.BoundDeviceSummary}",
+            _ when session.ProcessId > 0 && !session.IsRoutingSupported => $"{label} · {session.RoutingUnavailableReason ?? session.BoundDeviceSummary}",
             _ => $"{label} · {session.ActualDeviceSummary}"
         };
 
@@ -191,12 +192,13 @@ public sealed partial class SessionCardControl : UserControl
     private MenuFlyout BuildRouteFlyout(MixerSessionInfo session, EDataFlow flow)
     {
         var flyout = new MenuFlyout();
-        flyout.Items.Add(CreateRouteMenuItem(session, null, "跟随系统默认", string.IsNullOrWhiteSpace(session.BoundDeviceId)));
+        flyout.Items.Add(CreateRouteMenuItem(session, flow, null, "跟随系统默认", string.IsNullOrWhiteSpace(session.BoundDeviceId)));
 
         foreach (var device in devices.Where(device => device.Flow == flow))
         {
             flyout.Items.Add(CreateRouteMenuItem(
                 session,
+                flow,
                 device.Id,
                 device.Name,
                 string.Equals(device.Id, session.BoundDeviceId, StringComparison.OrdinalIgnoreCase)));
@@ -206,13 +208,13 @@ public sealed partial class SessionCardControl : UserControl
             devices.Where(device => device.Flow == flow)
                 .All(device => !string.Equals(device.Id, session.BoundDeviceId, StringComparison.OrdinalIgnoreCase)))
         {
-            flyout.Items.Add(CreateRouteMenuItem(session, session.BoundDeviceId, session.BoundDeviceSummary, true));
+            flyout.Items.Add(CreateRouteMenuItem(session, flow, session.BoundDeviceId, session.BoundDeviceSummary, true));
         }
 
         return flyout;
     }
 
-    private MenuFlyoutItem CreateRouteMenuItem(MixerSessionInfo session, string? deviceId, string title, bool selected)
+    private MenuFlyoutItem CreateRouteMenuItem(MixerSessionInfo session, EDataFlow flow, string? deviceId, string title, bool selected)
     {
         var item = new MenuFlyoutItem
         {
@@ -222,8 +224,47 @@ public sealed partial class SessionCardControl : UserControl
         if (selected)
             item.Icon = new FontIcon { Glyph = "\uE73E" };
 
-        item.Click += (_, _) => DeviceChanged?.Invoke(this, new MixerDeviceChangedEventArgs(session, deviceId));
+        item.Click += (_, _) =>
+        {
+            ApplyOptimisticRouteSelection(session, flow, deviceId, title);
+            DeviceChanged?.Invoke(this, new MixerDeviceChangedEventArgs(session, deviceId));
+        };
+
         return item;
+    }
+
+    private void ApplyOptimisticRouteSelection(MixerSessionInfo session, EDataFlow flow, string? deviceId, string title)
+    {
+        var updatedSession = new MixerSessionInfo
+        {
+            SessionKey = session.SessionKey,
+            DisplayName = session.DisplayName,
+            ActualDeviceSummary = session.ActualDeviceSummary,
+            BoundDeviceSummary = title,
+            ProcessName = session.ProcessName,
+            ExecutablePath = session.ExecutablePath,
+            BoundDeviceId = deviceId,
+            RoutingUnavailableReason = session.RoutingUnavailableReason,
+            Flow = session.Flow,
+            ProcessId = session.ProcessId,
+            Volume = session.Volume,
+            IsMuted = session.IsMuted,
+            IsSystemSession = session.IsSystemSession,
+            IsRoutingSupported = session.IsRoutingSupported
+        };
+
+        var outputSession = flow == EDataFlow.eRender ? updatedSession : appSession.OutputSession;
+        var inputSession = flow == EDataFlow.eCapture ? updatedSession : appSession.InputSession;
+
+        appSession = new MixerAppSessionInfo
+        {
+            SessionKey = appSession.SessionKey,
+            PrimarySession = outputSession ?? inputSession ?? updatedSession,
+            OutputSession = outputSession,
+            InputSession = inputSession
+        };
+
+        ApplySession();
     }
 
     private void RouteFlyout_Opened(object? sender, object e)

@@ -48,25 +48,6 @@ dotnet build -c Release
 - 构建版本号统一读取仓库根目录的 `VERSION`
 - `VERSION` 必须使用 `major.minor.patch` 格式，例如 `0.0.12`
 
-## 更新发布目录
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\Update-ReleasePayload.ps1
-```
-
-- 这条命令会直接把本地可运行的 `Release/win-x64` 构建产物输出到 `release-assets/win-x64/`
-- 不再需要手动复制文件
-- 更新完成后，连同 `VERSION` 一起提交即可触发 Release
-
-## 自动发版
-
-- 推送到 `main` 时，如果提交中包含 `VERSION` 变更，会自动触发 GitHub Actions 构建并发布 Release
-- Release 标签格式为 `v<version>`，例如 `v0.0.12`
-- Release 名称格式为 `AudioRoute v<version>`
-- 发布产物为 `win-x64` ZIP 包，并附带 `.sha256` 校验文件
-- Actions 不再重新构建应用，只会打包仓库里的 `release-assets/win-x64/` 目录并发布
-- 建议流程：先运行 `.\scripts\Update-ReleasePayload.ps1` 更新发布目录，再本地验证 `release-assets/win-x64/AudioRoute.exe` 可运行，随后修改 `VERSION` 并提交
-- 如需补发同一提交，可手动触发 `Release` 工作流
 
 ## 技术架构
 

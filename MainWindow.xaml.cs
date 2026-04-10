@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Numerics;
 using System.Runtime.InteropServices;
@@ -26,6 +27,7 @@ public sealed partial class MainWindow : Window
     private static readonly TimeSpan TrayReopenSuppressionDuration = TimeSpan.FromMilliseconds(300);
     private static readonly TimeSpan TrayIconRefreshInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan VisibleRefreshInterval = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan AudioChangeRefreshDebounceInterval = TimeSpan.FromMilliseconds(350);
     private static readonly TimeSpan PanelOpenOffsetAnimationDuration = TimeSpan.FromMilliseconds(240);
     private static readonly TimeSpan PanelOpenOpacityAnimationDuration = TimeSpan.FromMilliseconds(220);
     private static readonly TimeSpan PanelCloseOffsetAnimationDuration = TimeSpan.FromMilliseconds(120);
@@ -40,7 +42,9 @@ public sealed partial class MainWindow : Window
     private readonly DispatcherQueueTimer foregroundMonitorTimer;
     private readonly DispatcherQueueTimer refreshTimer;
     private readonly DispatcherQueueTimer trayIconTimer;
+    private readonly DispatcherQueueTimer audioChangeRefreshTimer;
     private readonly StaThreadDispatcher refreshDispatcher;
+    private readonly AudioChangeMonitor audioChangeMonitor;
     private readonly Dictionary<string, SessionCardControl> sessionCards = new(StringComparer.OrdinalIgnoreCase);
     private AppWindow? appWindow;
     private IntPtr hwnd;
@@ -108,6 +112,20 @@ public sealed partial class MainWindow : Window
                 UpdateTrayIcon();
         };
 
+        audioChangeRefreshTimer = DispatcherQueue.GetForCurrentThread().CreateTimer();
+        audioChangeRefreshTimer.Interval = AudioChangeRefreshDebounceInterval;
+        audioChangeRefreshTimer.IsRepeating = false;
+        audioChangeRefreshTimer.Tick += (_, _) =>
+        {
+            audioChangeRefreshTimer.Stop();
+
+            if (!isExitRequested && isPanelVisible)
+                RefreshData();
+        };
+
+        audioChangeMonitor = new AudioChangeMonitor();
+        audioChangeMonitor.Changed += OnAudioEnvironmentChanged;
+
         EnsureConfigured();
     }
 
@@ -141,6 +159,28 @@ public sealed partial class MainWindow : Window
             return;
 
         ScheduleDeactivateHide();
+    }
+
+    private void OnAudioEnvironmentChanged(object? sender, EventArgs e)
+    {
+        if (isExitRequested)
+            return;
+
+        DispatcherQueue.TryEnqueue(HandleAudioEnvironmentChanged);
+    }
+
+    private void HandleAudioEnvironmentChanged()
+    {
+        if (isExitRequested)
+            return;
+
+        lastSnapshot = null;
+
+        if (!isPanelVisible)
+            return;
+
+        audioChangeRefreshTimer.Stop();
+        audioChangeRefreshTimer.Start();
     }
 
     private void RefreshData()
@@ -184,6 +224,7 @@ public sealed partial class MainWindow : Window
         }
         catch (Exception ex)
         {
+            Trace.WriteLine($"[AudioRoute] 刷新音频会话失败: {ex}");
             if (refreshVersion == refreshGeneration && isPanelVisible)
                 ShowPlaceholder($"刷新音频会话失败: {ex.Message}");
         }
@@ -336,6 +377,12 @@ public sealed partial class MainWindow : Window
             if (e.Session.ProcessId <= 0)
                 return;
 
+            if (!e.Session.IsRoutingSupported)
+            {
+                ShowError(e.Session.RoutingUnavailableReason ?? "当前系统不支持应用级音频路由。");
+                return;
+            }
+
             if (string.IsNullOrWhiteSpace(e.DeviceId))
                 AudioPolicyManager.ClearAppDefaultDevice((uint)e.Session.ProcessId, e.Session.Flow);
             else
@@ -346,6 +393,9 @@ public sealed partial class MainWindow : Window
         }
         catch (Exception ex)
         {
+            Trace.WriteLine($"[AudioRoute] 更改设备失败: {ex}");
+            hasDeferredRefresh = true;
+            RefreshData();
             ShowError($"更改设备失败: {ex.Message}");
         }
     }
@@ -358,6 +408,7 @@ public sealed partial class MainWindow : Window
         }
         catch (Exception ex)
         {
+            Trace.WriteLine($"[AudioRoute] 调整音量失败: {ex}");
             ShowError($"调整音量失败: {ex.Message}");
         }
     }
@@ -421,6 +472,9 @@ public sealed partial class MainWindow : Window
         foregroundMonitorTimer.Stop();
         refreshTimer.Stop();
         trayIconTimer.Stop();
+        audioChangeRefreshTimer.Stop();
+        audioChangeMonitor.Changed -= OnAudioEnvironmentChanged;
+        audioChangeMonitor.Dispose();
         refreshDispatcher.Dispose();
         DisposeTrayIcon();
         TrayVolumeIconService.Dispose();

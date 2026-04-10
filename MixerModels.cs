@@ -11,12 +11,14 @@ public sealed class MixerSessionInfo
     public string ProcessName { get; init; } = string.Empty;
     public string? ExecutablePath { get; init; }
     public string? BoundDeviceId { get; init; }
+    public string? RoutingUnavailableReason { get; init; }
     public EDataFlow Flow { get; init; }
     public int ProcessId { get; init; }
     public float Volume { get; init; }
     public bool IsMuted { get; init; }
     public bool IsSystemSession { get; init; }
-    public bool CanChangeDevice => ProcessId > 0;
+    public bool IsRoutingSupported { get; init; } = true;
+    public bool CanChangeDevice => ProcessId > 0 && IsRoutingSupported;
 }
 
 public sealed class MixerAppSessionInfo

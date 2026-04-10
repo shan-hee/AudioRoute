@@ -19,6 +19,7 @@ public static class AudioSessionService
     public static IReadOnlyList<MixerSessionInfo> GetActiveSessions(EDataFlow flow, IReadOnlyDictionary<string, AudioDevice>? deviceMap = null)
     {
         deviceMap ??= CreateDeviceMap(DeviceEnumerator.EnumerateDevices(flow), flow);
+        var routingSupport = AudioPolicyManager.GetRoutingSupport();
         var aggregates = new Dictionary<string, SessionAggregate>(StringComparer.OrdinalIgnoreCase);
 
         using var enumerator = new MMDeviceEnumerator();
@@ -70,7 +71,7 @@ public static class AudioSessionService
         }
 
         return aggregates.Values
-            .Select(aggregate => aggregate.ToSnapshot(flow, deviceMap))
+            .Select(aggregate => aggregate.ToSnapshot(flow, deviceMap, routingSupport))
             .OrderBy(session => session.IsSystemSession ? 0 : 1)
             .ThenBy(session => session.DisplayName, StringComparer.CurrentCultureIgnoreCase)
             .ToList();
@@ -326,12 +327,17 @@ public static class AudioSessionService
             muted &= isMuted;
         }
 
-        public MixerSessionInfo ToSnapshot(EDataFlow flow, IReadOnlyDictionary<string, AudioDevice> deviceMap)
+        public MixerSessionInfo ToSnapshot(EDataFlow flow, IReadOnlyDictionary<string, AudioDevice> deviceMap, AudioRoutingSupport routingSupport)
         {
             string? boundDeviceId = null;
             var boundDeviceSummary = "跟随系统默认";
+            var routingUnavailableReason = routingSupport.UnavailableReason;
 
-            if (ProcessId > 0)
+            if (!routingSupport.IsSupported)
+            {
+                boundDeviceSummary = routingUnavailableReason ?? "当前系统不支持应用级音频路由。";
+            }
+            else if (ProcessId > 0)
             {
                 boundDeviceId = AudioPolicyManager.GetAppDefaultDevice((uint)ProcessId, flow);
                 if (!string.IsNullOrWhiteSpace(boundDeviceId) && deviceMap.TryGetValue(boundDeviceId, out var boundDevice))
@@ -358,6 +364,8 @@ public static class AudioSessionService
                 Volume = sampleCount == 0 ? 0f : totalVolume / sampleCount,
                 IsMuted = muted,
                 IsSystemSession = IsSystemSession,
+                IsRoutingSupported = routingSupport.IsSupported,
+                RoutingUnavailableReason = routingUnavailableReason,
                 ActualDeviceSummary = actualSummary,
                 BoundDeviceId = boundDeviceId,
                 BoundDeviceSummary = boundDeviceSummary
