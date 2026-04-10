@@ -32,11 +32,29 @@ AudioRoute.exe
 - 左键点击托盘图标重新打开面板
 - 右键点击托盘图标打开菜单（主页 / 退出）
 
-## 系统要求
+## 运行要求
 
 - Windows 10 1809 (Build 17763) 或更高版本
-- .NET 8.0
-- Windows App SDK 1.8+
+- GitHub Release 提供的自包含包无需额外安装 .NET Runtime 或 Windows App SDK Runtime
+
+## 构建
+
+```powershell
+dotnet build -c Release
+```
+
+- 本地源码构建需要 .NET 8 SDK
+- 构建版本号统一读取仓库根目录的 `VERSION`
+- `VERSION` 必须使用 `major.minor.patch` 格式，例如 `0.0.12`
+
+## 自动发版
+
+- 推送到 `main` 时，如果提交中包含 `VERSION` 变更，会自动触发 GitHub Actions 构建并发布 Release
+- Release 标签格式为 `v<version>`，例如 `v0.0.12`
+- Release 名称格式为 `AudioRoute v<version>`
+- 发布产物为 `win-x64` 自包含 ZIP 包，并附带 `.sha256` 校验文件
+- GitHub Release 面向直接分发，包含 .NET 运行时和 Windows App SDK 运行时依赖，不依赖目标机预装开发环境
+- 如需补发同一提交，可手动触发 `Release` 工作流
 
 ## 技术架构
 

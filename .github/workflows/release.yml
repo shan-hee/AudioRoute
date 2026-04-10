@@ -21,6 +21,8 @@ jobs:
       PUBLISH_DIR: artifacts/publish
       PACKAGE_DIR: artifacts/package
       RELEASE_DIR: artifacts/release
+      SELF_CONTAINED: true
+      WINDOWS_APP_SDK_SELF_CONTAINED: true
 
     steps:
       - name: Checkout
@@ -99,7 +101,7 @@ jobs:
 
       - name: Publish
         shell: pwsh
-        run: dotnet publish $env:PROJECT_PATH -c Release -r $env:RUNTIME_ID --self-contained false -o $env:PUBLISH_DIR /p:ContinuousIntegrationBuild=true
+        run: dotnet publish $env:PROJECT_PATH -c Release -r $env:RUNTIME_ID --self-contained $env:SELF_CONTAINED -o $env:PUBLISH_DIR /p:ContinuousIntegrationBuild=true /p:WindowsAppSDKSelfContained=$env:WINDOWS_APP_SDK_SELF_CONTAINED
 
       - name: Package release assets
         shell: pwsh
