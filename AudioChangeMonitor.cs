@@ -10,12 +10,42 @@ using NAudioPropertyKey = NAudio.CoreAudioApi.PropertyKey;
 
 namespace AudioRoute;
 
+internal sealed class ObservedSessionVolumeChangedEventArgs : EventArgs
+{
+    public ObservedSessionVolumeChangedEventArgs(string sessionKey, EDataFlow flow, float volume, bool isMuted)
+    {
+        SessionKey = sessionKey;
+        Flow = flow;
+        Volume = volume;
+        IsMuted = isMuted;
+    }
+
+    public string SessionKey { get; }
+
+    public EDataFlow Flow { get; }
+
+    public float Volume { get; }
+
+    public bool IsMuted { get; }
+}
+
+internal sealed class ObservedMasterVolumeChangedEventArgs : EventArgs
+{
+    public ObservedMasterVolumeChangedEventArgs(MasterVolumeState? state)
+    {
+        State = state;
+    }
+
+    public MasterVolumeState? State { get; }
+}
+
 internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
 {
     private readonly object syncRoot = new();
     private readonly MMDeviceEnumerator deviceEnumerator = new();
     private readonly List<DeviceRegistration> deviceRegistrations = new();
     private readonly Dictionary<string, SessionRegistration> sessionRegistrations = new(StringComparer.OrdinalIgnoreCase);
+    private DefaultRenderEndpointRegistration? defaultRenderEndpointRegistration;
     private bool disposed;
 
     public AudioChangeMonitor()
@@ -25,6 +55,10 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
     }
 
     public event EventHandler? Changed;
+
+    public event EventHandler<ObservedSessionVolumeChangedEventArgs>? SessionVolumeChanged;
+
+    public event EventHandler<ObservedMasterVolumeChangedEventArgs>? MasterVolumeChanged;
 
     public void Dispose()
     {
@@ -100,13 +134,38 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
     private void RebuildSubscriptionsCore()
     {
         ClearRegistrationsCore();
+        RebuildDefaultRenderEndpointRegistrationCore();
         RegisterFlowCore(NAudioDataFlow.Render);
         RegisterFlowCore(NAudioDataFlow.Capture);
+    }
+
+    private void RebuildDefaultRenderEndpointRegistrationCore()
+    {
+        defaultRenderEndpointRegistration?.Dispose();
+        defaultRenderEndpointRegistration = null;
+
+        try
+        {
+            var device = deviceEnumerator.GetDefaultAudioEndpoint(NAudioDataFlow.Render, Role.Multimedia);
+            var endpointVolume = device.AudioEndpointVolume;
+            AudioEndpointVolumeNotificationDelegate notificationHandler = notification =>
+                HandleMasterVolumeNotification(notification.MasterVolume, notification.Muted);
+
+            endpointVolume.OnVolumeNotification += notificationHandler;
+            defaultRenderEndpointRegistration = new DefaultRenderEndpointRegistration(device, endpointVolume, notificationHandler);
+        }
+        catch (Exception ex)
+        {
+            Trace.WriteLine($"[AudioRoute] Failed to register default render endpoint volume watcher: {ex}");
+        }
+
+        RaiseMasterVolumeChanged(MasterVolumeService.TryGetMasterVolumeState());
     }
 
     private void RegisterFlowCore(NAudioDataFlow flow)
     {
         MMDeviceCollection? devices = null;
+        var appFlow = ToAppFlow(flow);
 
         try
         {
@@ -122,7 +181,9 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
                     device = devices[index];
                     sessionManager = device.AudioSessionManager;
 
-                    var deviceRegistration = new DeviceRegistration(device, sessionManager, HandleSessionCreated);
+                    AudioSessionManager.SessionCreatedDelegate sessionCreatedHandler =
+                        (sender, newSessionControl) => HandleSessionCreated(appFlow, sender, newSessionControl);
+                    var deviceRegistration = new DeviceRegistration(device, sessionManager, sessionCreatedHandler);
                     sessionManager.OnSessionCreated += deviceRegistration.SessionCreatedHandler;
                     sessionManager.RefreshSessions();
 
@@ -138,7 +199,7 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
                         try
                         {
                             session = sessions[sessionIndex];
-                            if (TryTrackSessionCore(session))
+                            if (TryTrackSessionCore(session, appFlow))
                                 session = null;
                         }
                         finally
@@ -164,7 +225,7 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         }
     }
 
-    private bool TryTrackSessionCore(AudioSessionControl session)
+    private bool TryTrackSessionCore(AudioSessionControl session, EDataFlow flow)
     {
         if (disposed)
             return false;
@@ -173,18 +234,19 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         if (sessionRegistrations.ContainsKey(sessionId))
             return false;
 
+        var sessionKey = GetAppSessionKey(session);
         var handler = new SessionEventsHandler(
             onSessionStateChanged: state => HandleSessionStateChanged(sessionId, state),
             onSessionDisconnected: () => RemoveSessionAndRaise(sessionId),
             onMetadataChanged: RaiseChanged,
-            onVolumeChanged: RaiseChanged);
+            onVolumeChanged: (volume, isMuted) => HandleSessionVolumeChanged(sessionKey, flow, volume, isMuted));
 
         session.RegisterEventClient(handler);
         sessionRegistrations.Add(sessionId, new SessionRegistration(sessionId, session, handler));
         return true;
     }
 
-    private void HandleSessionCreated(object? sender, IAudioSessionControl newSessionControl)
+    private void HandleSessionCreated(EDataFlow flow, object? sender, IAudioSessionControl newSessionControl)
     {
         AudioSessionControl? session = null;
         var shouldRaise = false;
@@ -195,7 +257,7 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
 
             lock (syncRoot)
             {
-                if (TryTrackSessionCore(session))
+                if (TryTrackSessionCore(session, flow))
                 {
                     session = null;
                     shouldRaise = true;
@@ -227,6 +289,22 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         RaiseChanged();
     }
 
+    private void HandleSessionVolumeChanged(string sessionKey, EDataFlow flow, float volume, bool isMuted)
+    {
+        if (disposed)
+            return;
+
+        SessionVolumeChanged?.Invoke(this, new ObservedSessionVolumeChangedEventArgs(sessionKey, flow, volume, isMuted));
+    }
+
+    private void HandleMasterVolumeNotification(float volume, bool isMuted)
+    {
+        if (disposed)
+            return;
+
+        RaiseMasterVolumeChanged(MasterVolumeService.CreateState(volume, isMuted));
+    }
+
     private void RemoveSessionAndRaise(string sessionId)
     {
         lock (syncRoot)
@@ -245,6 +323,9 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
 
     private void ClearRegistrationsCore()
     {
+        defaultRenderEndpointRegistration?.Dispose();
+        defaultRenderEndpointRegistration = null;
+
         foreach (var registration in sessionRegistrations.Values)
             registration.Dispose();
 
@@ -262,6 +343,14 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
             return;
 
         Changed?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void RaiseMasterVolumeChanged(MasterVolumeState? state)
+    {
+        if (disposed)
+            return;
+
+        MasterVolumeChanged?.Invoke(this, new ObservedMasterVolumeChangedEventArgs(state));
     }
 
     private static string GetSessionIdentity(AudioSessionControl session)
@@ -290,6 +379,25 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
             return "system";
 
         return $"pid:{session.GetProcessID}";
+    }
+
+    private static string GetAppSessionKey(AudioSessionControl session)
+    {
+        if (session.IsSystemSoundsSession)
+            return "system";
+
+        var processId = checked((int)session.GetProcessID);
+        return processId <= 0 ? "system" : $"pid:{processId}";
+    }
+
+    private static EDataFlow ToAppFlow(NAudioDataFlow flow)
+    {
+        return flow switch
+        {
+            NAudioDataFlow.Render => EDataFlow.eRender,
+            NAudioDataFlow.Capture => EDataFlow.eCapture,
+            _ => EDataFlow.eAll
+        };
     }
 
     private sealed class DeviceRegistration : IDisposable
@@ -353,14 +461,52 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         }
     }
 
+    private sealed class DefaultRenderEndpointRegistration : IDisposable
+    {
+        public DefaultRenderEndpointRegistration(
+            MMDevice device,
+            AudioEndpointVolume endpointVolume,
+            AudioEndpointVolumeNotificationDelegate notificationHandler)
+        {
+            Device = device;
+            EndpointVolume = endpointVolume;
+            NotificationHandler = notificationHandler;
+        }
+
+        public MMDevice Device { get; }
+
+        public AudioEndpointVolume EndpointVolume { get; }
+
+        public AudioEndpointVolumeNotificationDelegate NotificationHandler { get; }
+
+        public void Dispose()
+        {
+            try
+            {
+                EndpointVolume.OnVolumeNotification -= NotificationHandler;
+            }
+            catch (Exception ex)
+            {
+                Trace.WriteLine($"[AudioRoute] Failed to unregister endpoint volume listener: {ex}");
+            }
+
+            EndpointVolume.Dispose();
+            Device.Dispose();
+        }
+    }
+
     private sealed class SessionEventsHandler : IAudioSessionEventsHandler
     {
         private readonly Action<NAudioAudioSessionState> onSessionStateChanged;
         private readonly Action onSessionDisconnected;
         private readonly Action onMetadataChanged;
-        private readonly Action onVolumeChanged;
+        private readonly Action<float, bool> onVolumeChanged;
 
-        public SessionEventsHandler(Action<NAudioAudioSessionState> onSessionStateChanged, Action onSessionDisconnected, Action onMetadataChanged, Action onVolumeChanged)
+        public SessionEventsHandler(
+            Action<NAudioAudioSessionState> onSessionStateChanged,
+            Action onSessionDisconnected,
+            Action onMetadataChanged,
+            Action<float, bool> onVolumeChanged)
         {
             this.onSessionStateChanged = onSessionStateChanged;
             this.onSessionDisconnected = onSessionDisconnected;
@@ -380,7 +526,7 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
 
         public void OnVolumeChanged(float volume, bool isMuted)
         {
-            onVolumeChanged();
+            onVolumeChanged(volume, isMuted);
         }
 
         public void OnChannelVolumeChanged(uint channelCount, IntPtr newVolumes, uint channelIndex)

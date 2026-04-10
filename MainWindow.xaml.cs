@@ -22,11 +22,12 @@ public sealed partial class MainWindow : Window
     private const int PanelHeight = 460;
     private const int ScreenMargin = 18;
     private static readonly TimeSpan DeactivateHideDelay = TimeSpan.FromMilliseconds(140);
-    private static readonly TimeSpan ForegroundMonitorInterval = TimeSpan.FromMilliseconds(650);
+    private static readonly TimeSpan ForegroundMonitorFallbackInterval = TimeSpan.FromMilliseconds(650);
     private static readonly TimeSpan HideSuppressionDuration = TimeSpan.FromMilliseconds(320);
     private static readonly TimeSpan TrayReopenSuppressionDuration = TimeSpan.FromMilliseconds(300);
-    private static readonly TimeSpan TrayIconRefreshInterval = TimeSpan.FromSeconds(1);
-    private static readonly TimeSpan VisibleRefreshInterval = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan SnapshotHealthCheckInterval = TimeSpan.FromMinutes(2);
+    private static readonly TimeSpan SnapshotRefreshOnOpenAge = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan SnapshotRefreshWhileVisibleAge = TimeSpan.FromMinutes(3);
     private static readonly TimeSpan AudioChangeRefreshDebounceInterval = TimeSpan.FromMilliseconds(350);
     private static readonly TimeSpan PanelOpenOffsetAnimationDuration = TimeSpan.FromMilliseconds(240);
     private static readonly TimeSpan PanelOpenOpacityAnimationDuration = TimeSpan.FromMilliseconds(220);
@@ -41,7 +42,6 @@ public sealed partial class MainWindow : Window
     private readonly DispatcherQueueTimer deactivateHideTimer;
     private readonly DispatcherQueueTimer foregroundMonitorTimer;
     private readonly DispatcherQueueTimer refreshTimer;
-    private readonly DispatcherQueueTimer trayIconTimer;
     private readonly DispatcherQueueTimer audioChangeRefreshTimer;
     private readonly StaThreadDispatcher refreshDispatcher;
     private readonly AudioChangeMonitor audioChangeMonitor;
@@ -56,13 +56,17 @@ public sealed partial class MainWindow : Window
     private bool isVisibilityTransitioning;
     private bool hasDeferredRefresh;
     private bool isTrayIconCreated;
+    private bool isSnapshotStale = true;
     private DateTimeOffset lastPrimaryTrayInvokeAt;
     private DateTimeOffset suppressPrimaryTrayInvokeUntil;
     private MasterVolumeState? lastTrayVolumeState;
     private PanelSnapshot? lastSnapshot;
+    private DateTimeOffset lastSnapshotUpdatedAt;
     private DateTimeOffset suppressHideUntil;
     private int interactionDepth;
     private int refreshGeneration;
+    private WinEventDelegate? foregroundEventDelegate;
+    private IntPtr foregroundEventHook;
     private WndProcDelegate? windowProcDelegate;
     private IntPtr originalWindowProc;
 
@@ -87,7 +91,7 @@ public sealed partial class MainWindow : Window
         };
 
         foregroundMonitorTimer = DispatcherQueue.GetForCurrentThread().CreateTimer();
-        foregroundMonitorTimer.Interval = ForegroundMonitorInterval;
+        foregroundMonitorTimer.Interval = ForegroundMonitorFallbackInterval;
         foregroundMonitorTimer.IsRepeating = true;
         foregroundMonitorTimer.Tick += async (_, _) =>
         {
@@ -96,20 +100,11 @@ public sealed partial class MainWindow : Window
         };
 
         refreshTimer = DispatcherQueue.GetForCurrentThread().CreateTimer();
-        refreshTimer.Interval = VisibleRefreshInterval;
+        refreshTimer.Interval = SnapshotHealthCheckInterval;
         refreshTimer.Tick += (_, _) =>
         {
             if (!isExitRequested && isPanelVisible)
-                RefreshData();
-        };
-
-        trayIconTimer = DispatcherQueue.GetForCurrentThread().CreateTimer();
-        trayIconTimer.Interval = TrayIconRefreshInterval;
-        trayIconTimer.IsRepeating = true;
-        trayIconTimer.Tick += (_, _) =>
-        {
-            if (!isExitRequested && isTrayIconCreated)
-                UpdateTrayIcon();
+                RefreshDataIfNeeded(SnapshotRefreshWhileVisibleAge);
         };
 
         audioChangeRefreshTimer = DispatcherQueue.GetForCurrentThread().CreateTimer();
@@ -119,12 +114,14 @@ public sealed partial class MainWindow : Window
         {
             audioChangeRefreshTimer.Stop();
 
-            if (!isExitRequested && isPanelVisible)
+            if (!isExitRequested && (isPanelVisible || lastSnapshot is not null))
                 RefreshData();
         };
 
         audioChangeMonitor = new AudioChangeMonitor();
         audioChangeMonitor.Changed += OnAudioEnvironmentChanged;
+        audioChangeMonitor.SessionVolumeChanged += OnObservedSessionVolumeChanged;
+        audioChangeMonitor.MasterVolumeChanged += OnObservedMasterVolumeChanged;
 
         EnsureConfigured();
     }
@@ -149,6 +146,7 @@ public sealed partial class MainWindow : Window
             return;
 
         isConfigured = true;
+        AttachForegroundEventHook();
         InitializeTrayIcon();
         RefreshData();
     }
@@ -169,18 +167,56 @@ public sealed partial class MainWindow : Window
         DispatcherQueue.TryEnqueue(HandleAudioEnvironmentChanged);
     }
 
+    private void OnObservedSessionVolumeChanged(object? sender, ObservedSessionVolumeChangedEventArgs e)
+    {
+        if (isExitRequested)
+            return;
+
+        DispatcherQueue.TryEnqueue(() => HandleObservedSessionVolumeChanged(e));
+    }
+
+    private void OnObservedMasterVolumeChanged(object? sender, ObservedMasterVolumeChangedEventArgs e)
+    {
+        if (isExitRequested)
+            return;
+
+        DispatcherQueue.TryEnqueue(() => HandleObservedMasterVolumeChanged(e));
+    }
+
     private void HandleAudioEnvironmentChanged()
     {
         if (isExitRequested)
             return;
 
-        lastSnapshot = null;
+        isSnapshotStale = true;
 
-        if (!isPanelVisible)
+        if (!isPanelVisible && lastSnapshot is null)
             return;
 
         audioChangeRefreshTimer.Stop();
         audioChangeRefreshTimer.Start();
+    }
+
+    private void HandleObservedSessionVolumeChanged(ObservedSessionVolumeChangedEventArgs e)
+    {
+        if (isExitRequested)
+            return;
+
+        UpdateCachedSessionVolume(e.SessionKey, e.Flow, e.Volume, e.IsMuted);
+
+        if (!isPanelVisible)
+            return;
+
+        if (sessionCards.TryGetValue(e.SessionKey, out var card))
+            card.ApplyObservedVolume(e.Flow, e.Volume, e.IsMuted);
+    }
+
+    private void HandleObservedMasterVolumeChanged(ObservedMasterVolumeChangedEventArgs e)
+    {
+        if (isExitRequested || !isTrayIconCreated)
+            return;
+
+        UpdateTrayIcon(e.State);
     }
 
     private void RefreshData()
@@ -217,7 +253,11 @@ public sealed partial class MainWindow : Window
                 return;
 
             lastSnapshot = snapshot;
-            ApplyPanelSnapshot(snapshot);
+            lastSnapshotUpdatedAt = DateTimeOffset.UtcNow;
+            isSnapshotStale = false;
+
+            if (isPanelVisible)
+                ApplyPanelSnapshot(snapshot);
         }
         catch when (isExitRequested)
         {
@@ -330,6 +370,18 @@ public sealed partial class MainWindow : Window
         ShowPlaceholder("正在加载音频会话...");
     }
 
+    private void RefreshDataIfNeeded(TimeSpan maxSnapshotAge)
+    {
+        if (lastSnapshot is null || isSnapshotStale)
+        {
+            RefreshData();
+            return;
+        }
+
+        if (DateTimeOffset.UtcNow - lastSnapshotUpdatedAt >= maxSnapshotAge)
+            RefreshData();
+    }
+
     private static IReadOnlyList<MixerAppSessionInfo> MergeSessions(
         IReadOnlyList<MixerSessionInfo> outputSessions,
         IReadOnlyList<MixerSessionInfo> inputSessions)
@@ -388,8 +440,14 @@ public sealed partial class MainWindow : Window
             else
                 AudioPolicyManager.SetAppDefaultDevice((uint)e.Session.ProcessId, e.DeviceId, e.Session.Flow);
 
-            hasDeferredRefresh = true;
-            RefreshData();
+            UpdateCachedSessionRoute(e.Session.SessionKey, e.Session.Flow, e.DeviceId, e.SelectedDeviceSummary);
+            isSnapshotStale = true;
+
+            if (isPanelVisible)
+            {
+                audioChangeRefreshTimer.Stop();
+                audioChangeRefreshTimer.Start();
+            }
         }
         catch (Exception ex)
         {
@@ -405,6 +463,7 @@ public sealed partial class MainWindow : Window
         try
         {
             AudioSessionService.SetSessionVolume(e.Session.SessionKey, e.Session.Flow, e.Volume);
+            UpdateCachedSessionVolume(e.Session.SessionKey, e.Session.Flow, e.Volume, isMuted: e.Volume <= 0.005f);
         }
         catch (Exception ex)
         {
@@ -479,9 +538,11 @@ public sealed partial class MainWindow : Window
         deactivateHideTimer.Stop();
         foregroundMonitorTimer.Stop();
         refreshTimer.Stop();
-        trayIconTimer.Stop();
         audioChangeRefreshTimer.Stop();
+        DetachForegroundEventHook();
         audioChangeMonitor.Changed -= OnAudioEnvironmentChanged;
+        audioChangeMonitor.SessionVolumeChanged -= OnObservedSessionVolumeChanged;
+        audioChangeMonitor.MasterVolumeChanged -= OnObservedMasterVolumeChanged;
         audioChangeMonitor.Dispose();
         refreshDispatcher.Dispose();
         DisposeTrayIcon();
@@ -522,8 +583,8 @@ public sealed partial class MainWindow : Window
             isPanelVisible = true;
             suppressHideUntil = DateTimeOffset.UtcNow + HideSuppressionDuration;
             allowDeactivateHide = true;
-            foregroundMonitorTimer.Start();
-            RefreshData();
+            StartForegroundMonitorFallbackIfNeeded();
+            RefreshDataIfNeeded(SnapshotRefreshOnOpenAge);
         }
         finally
         {
@@ -578,8 +639,7 @@ public sealed partial class MainWindow : Window
         NativeMethods.SetWindowCloaked(hwnd, false);
         suppressHideUntil = DateTimeOffset.UtcNow + HideSuppressionDuration;
         allowDeactivateHide = true;
-        if (!foregroundMonitorTimer.IsRunning)
-            foregroundMonitorTimer.Start();
+        StartForegroundMonitorFallbackIfNeeded();
     }
 
     private void ScheduleDeactivateHide()
@@ -607,6 +667,66 @@ public sealed partial class MainWindow : Window
     {
         if (deactivateHideTimer.IsRunning)
             deactivateHideTimer.Stop();
+    }
+
+    private void AttachForegroundEventHook()
+    {
+        if (foregroundEventHook != IntPtr.Zero)
+            return;
+
+        foregroundEventDelegate = ForegroundEventProc;
+        foregroundEventHook = NativeMethods.SetWinEventHook(
+            NativeMethods.EventSystemForeground,
+            NativeMethods.EventSystemForeground,
+            IntPtr.Zero,
+            foregroundEventDelegate,
+            0,
+            0,
+            NativeMethods.WineventOutofcontext | NativeMethods.WineventSkipOwnProcess);
+
+        if (foregroundEventHook == IntPtr.Zero)
+            Trace.WriteLine("[AudioRoute] Failed to attach foreground event hook, fallback timer will be used.");
+    }
+
+    private void DetachForegroundEventHook()
+    {
+        if (foregroundEventHook != IntPtr.Zero)
+        {
+            _ = NativeMethods.UnhookWinEvent(foregroundEventHook);
+            foregroundEventHook = IntPtr.Zero;
+        }
+
+        foregroundEventDelegate = null;
+    }
+
+    private void StartForegroundMonitorFallbackIfNeeded()
+    {
+        if (foregroundEventHook != IntPtr.Zero)
+            return;
+
+        if (!foregroundMonitorTimer.IsRunning)
+            foregroundMonitorTimer.Start();
+    }
+
+    private void ForegroundEventProc(
+        IntPtr hWinEventHook,
+        uint eventType,
+        IntPtr eventWindow,
+        int idObject,
+        int idChild,
+        uint eventThread,
+        uint eventTime)
+    {
+        if (eventType != NativeMethods.EventSystemForeground ||
+            idObject != NativeMethods.ObjIdWindow ||
+            isExitRequested ||
+            !isPanelVisible ||
+            !allowDeactivateHide)
+        {
+            return;
+        }
+
+        DispatcherQueue.TryEnqueue(HandlePanelDeactivated);
     }
 
     private static Task AnimatePanelAsync(
@@ -693,8 +813,7 @@ public sealed partial class MainWindow : Window
         notifyIconData.uVersionOrTimeout = NativeMethods.NotifyIconVersion4;
         _ = NativeMethods.ShellNotifyIcon(NativeMethods.NimSetVersion, ref notifyIconData);
         isTrayIconCreated = true;
-        trayIconTimer.Start();
-        UpdateTrayIcon(force: true);
+        UpdateTrayIcon(lastTrayVolumeState, force: true);
     }
 
     private void DisposeTrayIcon()
@@ -762,10 +881,14 @@ public sealed partial class MainWindow : Window
 
     private void UpdateTrayIcon(bool force = false)
     {
+        UpdateTrayIcon(MasterVolumeService.TryGetMasterVolumeState(), force);
+    }
+
+    private void UpdateTrayIcon(MasterVolumeState? currentState, bool force = false)
+    {
         if (!isTrayIconCreated)
             return;
 
-        var currentState = MasterVolumeService.TryGetMasterVolumeState();
         if (!force && EqualityComparer<MasterVolumeState?>.Default.Equals(currentState, lastTrayVolumeState))
             return;
 
@@ -784,6 +907,138 @@ public sealed partial class MainWindow : Window
         return volumeState.Value.IsMuted
             ? $"AudioRoute 主音量 {volumeState.Value.Percentage}% 已静音"
             : $"AudioRoute 主音量 {volumeState.Value.Percentage}%";
+    }
+
+    private void UpdateCachedSessionVolume(string sessionKey, EDataFlow flow, float volume, bool isMuted)
+    {
+        if (lastSnapshot is null)
+            return;
+
+        var changed = false;
+        var updatedSessions = new List<MixerAppSessionInfo>(lastSnapshot.Sessions.Count);
+
+        foreach (var appSession in lastSnapshot.Sessions)
+        {
+            if (!string.Equals(appSession.SessionKey, sessionKey, StringComparison.OrdinalIgnoreCase))
+            {
+                updatedSessions.Add(appSession);
+                continue;
+            }
+
+            var session = appSession.GetSession(flow);
+            if (session is null)
+            {
+                updatedSessions.Add(appSession);
+                continue;
+            }
+
+            var updatedSession = CloneSessionWithVolume(session, volume, isMuted);
+            var outputSession = flow == EDataFlow.eRender ? updatedSession : appSession.OutputSession;
+            var inputSession = flow == EDataFlow.eCapture ? updatedSession : appSession.InputSession;
+
+            updatedSessions.Add(new MixerAppSessionInfo
+            {
+                SessionKey = appSession.SessionKey,
+                PrimarySession = outputSession ?? inputSession ?? updatedSession,
+                OutputSession = outputSession,
+                InputSession = inputSession
+            });
+
+            changed = true;
+        }
+
+        if (changed)
+        {
+            lastSnapshot = lastSnapshot with { Sessions = updatedSessions };
+            lastSnapshotUpdatedAt = DateTimeOffset.UtcNow;
+        }
+    }
+
+    private void UpdateCachedSessionRoute(string sessionKey, EDataFlow flow, string? boundDeviceId, string boundDeviceSummary)
+    {
+        if (lastSnapshot is null)
+            return;
+
+        var changed = false;
+        var updatedSessions = new List<MixerAppSessionInfo>(lastSnapshot.Sessions.Count);
+
+        foreach (var appSession in lastSnapshot.Sessions)
+        {
+            if (!string.Equals(appSession.SessionKey, sessionKey, StringComparison.OrdinalIgnoreCase))
+            {
+                updatedSessions.Add(appSession);
+                continue;
+            }
+
+            var session = appSession.GetSession(flow);
+            if (session is null)
+            {
+                updatedSessions.Add(appSession);
+                continue;
+            }
+
+            var updatedSession = CloneSessionWithRoute(session, boundDeviceId, boundDeviceSummary);
+            var outputSession = flow == EDataFlow.eRender ? updatedSession : appSession.OutputSession;
+            var inputSession = flow == EDataFlow.eCapture ? updatedSession : appSession.InputSession;
+
+            updatedSessions.Add(new MixerAppSessionInfo
+            {
+                SessionKey = appSession.SessionKey,
+                PrimarySession = outputSession ?? inputSession ?? updatedSession,
+                OutputSession = outputSession,
+                InputSession = inputSession
+            });
+
+            changed = true;
+        }
+
+        if (changed)
+        {
+            lastSnapshot = lastSnapshot with { Sessions = updatedSessions };
+            lastSnapshotUpdatedAt = DateTimeOffset.UtcNow;
+        }
+    }
+
+    private static MixerSessionInfo CloneSessionWithVolume(MixerSessionInfo session, float volume, bool isMuted)
+    {
+        return new MixerSessionInfo
+        {
+            SessionKey = session.SessionKey,
+            DisplayName = session.DisplayName,
+            ActualDeviceSummary = session.ActualDeviceSummary,
+            BoundDeviceSummary = session.BoundDeviceSummary,
+            ProcessName = session.ProcessName,
+            ExecutablePath = session.ExecutablePath,
+            BoundDeviceId = session.BoundDeviceId,
+            RoutingUnavailableReason = session.RoutingUnavailableReason,
+            Flow = session.Flow,
+            ProcessId = session.ProcessId,
+            Volume = volume,
+            IsMuted = isMuted,
+            IsSystemSession = session.IsSystemSession,
+            IsRoutingSupported = session.IsRoutingSupported
+        };
+    }
+
+    private static MixerSessionInfo CloneSessionWithRoute(MixerSessionInfo session, string? boundDeviceId, string boundDeviceSummary)
+    {
+        return new MixerSessionInfo
+        {
+            SessionKey = session.SessionKey,
+            DisplayName = session.DisplayName,
+            ActualDeviceSummary = session.ActualDeviceSummary,
+            BoundDeviceSummary = boundDeviceSummary,
+            ProcessName = session.ProcessName,
+            ExecutablePath = session.ExecutablePath,
+            BoundDeviceId = boundDeviceId,
+            RoutingUnavailableReason = session.RoutingUnavailableReason,
+            Flow = session.Flow,
+            ProcessId = session.ProcessId,
+            Volume = session.Volume,
+            IsMuted = session.IsMuted,
+            IsSystemSession = session.IsSystemSession,
+            IsRoutingSupported = session.IsRoutingSupported
+        };
     }
 
     private IntPtr WindowProc(IntPtr windowHandle, uint message, IntPtr wParam, IntPtr lParam)
@@ -1178,6 +1433,7 @@ public sealed partial class MainWindow : Window
         public const uint WmLButtonUp = 0x0202;
         public const uint WmNull = 0x0000;
         public const uint WmRButtonUp = 0x0205;
+        public const uint EventSystemForeground = 0x0003;
         public const uint NinSelect = 0x0400;
         public const uint NimAdd = 0x00000000;
         public const uint NimModify = 0x00000001;
@@ -1192,6 +1448,9 @@ public sealed partial class MainWindow : Window
         public const uint MfString = 0x00000000;
         public const uint MfChecked = 0x00000008;
         public const uint MfSeparator = 0x00000800;
+        public const uint WineventOutofcontext = 0x0000;
+        public const uint WineventSkipOwnProcess = 0x0002;
+        public const int ObjIdWindow = 0;
         public static readonly uint WmTaskbarCreated = RegisterWindowMessage("TaskbarCreated");
         private const uint SwpFrameChanged = 0x0020;
         private const uint SwpNomove = 0x0002;
@@ -1310,6 +1569,19 @@ public sealed partial class MainWindow : Window
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool TrackPopupMenu(IntPtr hMenu, uint uFlags, int x, int y, int nReserved, IntPtr hWnd, IntPtr prcRect);
 
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr SetWinEventHook(
+            uint eventMin,
+            uint eventMax,
+            IntPtr hmodWinEventProc,
+            WinEventDelegate lpfnWinEventProc,
+            uint idProcess,
+            uint idThread,
+            uint dwFlags);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool UnhookWinEvent(IntPtr hWinEventHook);
+
         [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern bool Shell_NotifyIcon(uint dwMessage, ref NotifyIconData lpData);
 
@@ -1392,6 +1664,15 @@ public sealed partial class MainWindow : Window
     }
 
     private sealed record PanelSnapshot(IReadOnlyList<AudioDevice> Devices, IReadOnlyList<MixerAppSessionInfo> Sessions);
+
+    private delegate void WinEventDelegate(
+        IntPtr hWinEventHook,
+        uint eventType,
+        IntPtr hwnd,
+        int idObject,
+        int idChild,
+        uint eventThread,
+        uint eventTime);
 
     private delegate IntPtr WndProcDelegate(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 }

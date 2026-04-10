@@ -66,15 +66,18 @@ public sealed class MixerAppSessionInfo
 
 public sealed class MixerDeviceChangedEventArgs : EventArgs
 {
-    public MixerDeviceChangedEventArgs(MixerSessionInfo session, string? deviceId)
+    public MixerDeviceChangedEventArgs(MixerSessionInfo session, string? deviceId, string selectedDeviceSummary)
     {
         Session = session;
         DeviceId = deviceId;
+        SelectedDeviceSummary = selectedDeviceSummary;
     }
 
     public MixerSessionInfo Session { get; }
 
     public string? DeviceId { get; }
+
+    public string SelectedDeviceSummary { get; }
 }
 
 public sealed class MixerVolumeChangedEventArgs : EventArgs

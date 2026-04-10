@@ -21,6 +21,7 @@ public sealed partial class SessionCardControl : UserControl
     private bool isInteracting;
     private bool hasPendingVolumeCommit;
     private float lastCommittedVolume;
+    private float lastAudibleVolume = 1f;
     private float? pendingUiVolume;
     private DateTimeOffset pendingUiVolumeUntil;
     private bool isMuted;
@@ -59,6 +60,38 @@ public sealed partial class SessionCardControl : UserControl
     {
         ClearPendingVolumeOverride();
         lastCommittedVolume = VolumeSession?.Volume ?? lastCommittedVolume;
+        if (lastCommittedVolume > 0.005f)
+            lastAudibleVolume = lastCommittedVolume;
+    }
+
+    public void ApplyObservedVolume(EDataFlow flow, float volume, bool muted)
+    {
+        if (!TryUpdateSessionVolume(flow, volume, muted))
+            return;
+
+        if (flow != volumeFlow)
+            return;
+
+        if (isVolumeInteracting)
+        {
+            if (pendingUiVolume is float optimisticVolume && Math.Abs(optimisticVolume - volume) < 0.01f)
+                ClearPendingVolumeOverride();
+
+            return;
+        }
+
+        volumeCommitTimer.Stop();
+        ClearPendingVolumeOverride();
+        hasPendingVolumeCommit = false;
+        lastCommittedVolume = volume;
+        if (volume > 0.005f)
+            lastAudibleVolume = volume;
+        isMuted = muted;
+        updatingUi = true;
+        VolumeSlider.Value = Math.Clamp((int)Math.Round(volume * 100), 0, 100);
+        updatingUi = false;
+        UpdateMuteIcon();
+        UpdateVolumeText();
     }
 
     private MixerSessionInfo? VolumeSession => appSession.GetSession(volumeFlow);
@@ -121,6 +154,8 @@ public sealed partial class SessionCardControl : UserControl
             VolumeSlider.Value = Math.Clamp((int)Math.Round(displayVolume * 100), 0, 100);
             updatingUi = false;
             lastCommittedVolume = displayVolume;
+            if (displayVolume > 0.005f)
+                lastAudibleVolume = displayVolume;
             hasPendingVolumeCommit = false;
         }
 
@@ -160,15 +195,23 @@ public sealed partial class SessionCardControl : UserControl
         if (VolumeSession is null)
             return;
 
-        if (isMuted)
+        if (VolumeSlider.Value <= 0)
         {
+            var restoreVolume = Math.Clamp(lastAudibleVolume, 0.05f, 1f);
             isMuted = false;
-            if (VolumeSlider.Value == 0)
-                VolumeSlider.Value = 100;
+            updatingUi = true;
+            VolumeSlider.Value = Math.Clamp((int)Math.Round(restoreVolume * 100), 0, 100);
+            updatingUi = false;
+            hasPendingVolumeCommit = true;
+            CommitVolumeChange();
         }
         else
         {
-            isMuted = true;
+            var currentVolume = (float)(VolumeSlider.Value / 100d);
+            if (currentVolume > 0.005f)
+                lastAudibleVolume = currentVolume;
+
+            isMuted = false;
             updatingUi = true;
             VolumeSlider.Value = 0;
             updatingUi = false;
@@ -238,7 +281,7 @@ public sealed partial class SessionCardControl : UserControl
         item.Click += (_, _) =>
         {
             ApplyOptimisticRouteSelection(session, flow, deviceId, title);
-            DeviceChanged?.Invoke(this, new MixerDeviceChangedEventArgs(session, deviceId));
+            DeviceChanged?.Invoke(this, new MixerDeviceChangedEventArgs(session, deviceId, title));
         };
 
         return item;
@@ -246,34 +289,8 @@ public sealed partial class SessionCardControl : UserControl
 
     private void ApplyOptimisticRouteSelection(MixerSessionInfo session, EDataFlow flow, string? deviceId, string title)
     {
-        var updatedSession = new MixerSessionInfo
-        {
-            SessionKey = session.SessionKey,
-            DisplayName = session.DisplayName,
-            ActualDeviceSummary = session.ActualDeviceSummary,
-            BoundDeviceSummary = title,
-            ProcessName = session.ProcessName,
-            ExecutablePath = session.ExecutablePath,
-            BoundDeviceId = deviceId,
-            RoutingUnavailableReason = session.RoutingUnavailableReason,
-            Flow = session.Flow,
-            ProcessId = session.ProcessId,
-            Volume = session.Volume,
-            IsMuted = session.IsMuted,
-            IsSystemSession = session.IsSystemSession,
-            IsRoutingSupported = session.IsRoutingSupported
-        };
-
-        var outputSession = flow == EDataFlow.eRender ? updatedSession : appSession.OutputSession;
-        var inputSession = flow == EDataFlow.eCapture ? updatedSession : appSession.InputSession;
-
-        appSession = new MixerAppSessionInfo
-        {
-            SessionKey = appSession.SessionKey,
-            PrimarySession = outputSession ?? inputSession ?? updatedSession,
-            OutputSession = outputSession,
-            InputSession = inputSession
-        };
+        var updatedSession = CloneSession(session, useBoundDeviceId: true, boundDeviceId: deviceId, boundDeviceSummary: title);
+        ReplaceSession(flow, updatedSession);
 
         ApplySession();
     }
@@ -436,6 +453,57 @@ public sealed partial class SessionCardControl : UserControl
     {
         pendingUiVolume = null;
         pendingUiVolumeUntil = default;
+    }
+
+    private bool TryUpdateSessionVolume(EDataFlow flow, float volume, bool muted)
+    {
+        var session = appSession.GetSession(flow);
+        if (session is null)
+            return false;
+
+        ReplaceSession(flow, CloneSession(session, volume: volume, isMuted: muted));
+        return true;
+    }
+
+    private void ReplaceSession(EDataFlow flow, MixerSessionInfo updatedSession)
+    {
+        var outputSession = flow == EDataFlow.eRender ? updatedSession : appSession.OutputSession;
+        var inputSession = flow == EDataFlow.eCapture ? updatedSession : appSession.InputSession;
+
+        appSession = new MixerAppSessionInfo
+        {
+            SessionKey = appSession.SessionKey,
+            PrimarySession = outputSession ?? inputSession ?? updatedSession,
+            OutputSession = outputSession,
+            InputSession = inputSession
+        };
+    }
+
+    private static MixerSessionInfo CloneSession(
+        MixerSessionInfo session,
+        bool useBoundDeviceId = false,
+        string? boundDeviceId = null,
+        string? boundDeviceSummary = null,
+        float? volume = null,
+        bool? isMuted = null)
+    {
+        return new MixerSessionInfo
+        {
+            SessionKey = session.SessionKey,
+            DisplayName = session.DisplayName,
+            ActualDeviceSummary = session.ActualDeviceSummary,
+            BoundDeviceSummary = boundDeviceSummary ?? session.BoundDeviceSummary,
+            ProcessName = session.ProcessName,
+            ExecutablePath = session.ExecutablePath,
+            BoundDeviceId = useBoundDeviceId ? boundDeviceId : session.BoundDeviceId,
+            RoutingUnavailableReason = session.RoutingUnavailableReason,
+            Flow = session.Flow,
+            ProcessId = session.ProcessId,
+            Volume = volume ?? session.Volume,
+            IsMuted = isMuted ?? session.IsMuted,
+            IsSystemSession = session.IsSystemSession,
+            IsRoutingSupported = session.IsRoutingSupported
+        };
     }
 
     private void UpdateInteractionState()

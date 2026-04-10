@@ -22,18 +22,23 @@ public static class MasterVolumeService
             using var enumerator = new MMDeviceEnumerator();
             using var device = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
 
-            var percentage = Math.Clamp((int)Math.Round(device.AudioEndpointVolume.MasterVolumeLevelScalar * 100), 0, 100);
-            var isMuted = device.AudioEndpointVolume.Mute || percentage == 0;
-
-            return new MasterVolumeState(
-                percentage,
-                isMuted,
-                ResolveIconKind(percentage, isMuted));
+            return CreateState(device.AudioEndpointVolume.MasterVolumeLevelScalar, device.AudioEndpointVolume.Mute);
         }
         catch
         {
             return null;
         }
+    }
+
+    public static MasterVolumeState CreateState(float volumeScalar, bool isMuted)
+    {
+        var percentage = Math.Clamp((int)Math.Round(volumeScalar * 100), 0, 100);
+        var effectiveMuted = isMuted || percentage == 0;
+
+        return new MasterVolumeState(
+            percentage,
+            effectiveMuted,
+            ResolveIconKind(percentage, effectiveMuted));
     }
 
     private static TrayVolumeIconKind ResolveIconKind(int percentage, bool isMuted)
