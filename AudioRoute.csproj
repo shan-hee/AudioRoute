@@ -1,6 +1,15 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
+    <VersionFile>$(MSBuildThisFileDirectory)VERSION</VersionFile>
+    <VersionRegexPattern>^\d+\.\d+\.\d+$</VersionRegexPattern>
+    <VersionFileValue Condition="Exists('$(VersionFile)')">$([System.IO.File]::ReadAllText('$(VersionFile)').Trim())</VersionFileValue>
+    <VersionPrefix>0.0.0</VersionPrefix>
+    <VersionPrefix Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(VersionFileValue)', '$(VersionRegexPattern)'))">$(VersionFileValue)</VersionPrefix>
+    <Version>$(VersionPrefix)</Version>
+    <AssemblyVersion>$(VersionPrefix).0</AssemblyVersion>
+    <FileVersion>$(VersionPrefix).0</FileVersion>
+    <InformationalVersion>$(VersionPrefix)</InformationalVersion>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
     <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
@@ -15,5 +24,10 @@
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260317003" />
     <PackageReference Include="NAudio" Version="2.2.1" />
   </ItemGroup>
+
+  <Target Name="ValidateVersionFromFile" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('$(VersionFile)')" Text="VERSION file not found: $(VersionFile)" />
+    <Error Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(VersionFileValue)', '$(VersionRegexPattern)')) != 'True'" Text="VERSION must use major.minor.patch format. Current value: '$(VersionFileValue)'" />
+  </Target>
 
 </Project>

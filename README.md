@@ -44,6 +44,17 @@ AudioRoute.exe
 dotnet build -c Release
 ```
 
+- 构建版本号统一读取仓库根目录的 `VERSION`
+- `VERSION` 必须使用 `major.minor.patch` 格式，例如 `0.0.2`
+
+## 自动发版
+
+- 推送到 `main` 时，如果提交中包含 `VERSION` 变更，会自动触发 GitHub Actions 构建并发布 Release
+- Release 标签格式为 `v<version>`，例如 `v0.0.2`
+- Release 名称格式为 `AudioRoute v<version>`
+- 发布产物为 `win-x64` ZIP 包，并附带 `.sha256` 校验文件
+- 如需补发同一提交，可手动触发 `Release` 工作流
+
 ## 技术架构
 
 ```

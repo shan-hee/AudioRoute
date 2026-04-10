@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - VERSION
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-2022
+
+    env:
+      PROJECT_PATH: AudioRoute.csproj
+      RUNTIME_ID: win-x64
+      PUBLISH_DIR: artifacts/publish
+      PACKAGE_DIR: artifacts/package
+      RELEASE_DIR: artifacts/release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('AudioRoute.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Resolve version metadata
+        shell: pwsh
+        run: |
+          $version = (Get-Content -Raw VERSION).Trim()
+          if ([string]::IsNullOrWhiteSpace($version) -or $version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "VERSION must use major.minor.patch format. Current value: '$version'"
+          }
+
+          $tagName = "v$version"
+          $releaseName = "AudioRoute $tagName"
+          $assetBaseName = "AudioRoute-$tagName-win-x64"
+
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TAG_NAME=$tagName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RELEASE_NAME=$releaseName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ASSET_BASENAME=$assetBaseName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Ensure release version is new
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $remoteTag = git ls-remote --tags origin "refs/tags/$env:TAG_NAME"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to query remote tags from origin."
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace($remoteTag)) {
+            throw "Tag $env:TAG_NAME already exists on origin."
+          }
+
+          & gh release view $env:TAG_NAME --repo "${{ github.repository }}" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release $env:TAG_NAME already exists."
+          }
+
+      - name: Restore
+        shell: pwsh
+        run: dotnet restore $env:PROJECT_PATH
+
+      - name: Publish
+        shell: pwsh
+        run: dotnet publish $env:PROJECT_PATH -c Release -r $env:RUNTIME_ID --self-contained false -o $env:PUBLISH_DIR /p:ContinuousIntegrationBuild=true
+
+      - name: Package release assets
+        shell: pwsh
+        run: |
+          $publishDir = (Resolve-Path $env:PUBLISH_DIR).Path
+          $packageDir = Join-Path $env:GITHUB_WORKSPACE $env:PACKAGE_DIR
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE $env:RELEASE_DIR
+          $packageRoot = Join-Path $packageDir $env:ASSET_BASENAME
+          $zipPath = Join-Path $releaseDir "$env:ASSET_BASENAME.zip"
+          $hashPath = Join-Path $releaseDir "$env:ASSET_BASENAME.sha256"
+
+          if (Test-Path $packageDir) {
+            Remove-Item $packageDir -Recurse -Force
+          }
+
+          if (Test-Path $releaseDir) {
+            Remove-Item $releaseDir -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
+          New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
+
+          Copy-Item (Join-Path $publishDir "*") -Destination $packageRoot -Recurse -Force
+          Compress-Archive -Path $packageRoot -DestinationPath $zipPath -Force
+
+          $hash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path $hashPath -Value "$hash  $(Split-Path $zipPath -Leaf)" -Encoding ascii
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE $env:RELEASE_DIR
+          $zipAsset = Join-Path $releaseDir "$env:ASSET_BASENAME.zip"
+          $hashAsset = Join-Path $releaseDir "$env:ASSET_BASENAME.sha256"
+
+          gh release create $env:TAG_NAME $zipAsset $hashAsset --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "$env:RELEASE_NAME" --generate-notes
