@@ -408,7 +408,12 @@ public sealed partial class MainWindow : Window
         }
         catch (Exception ex)
         {
+            if (sender is SessionCardControl card)
+                card.NotifyVolumeCommitFailed();
+
             Trace.WriteLine($"[AudioRoute] 调整音量失败: {ex}");
+            hasDeferredRefresh = true;
+            RefreshData();
             ShowError($"调整音量失败: {ex.Message}");
         }
     }
@@ -420,7 +425,10 @@ public sealed partial class MainWindow : Window
             interactionDepth = 0;
 
         if (interactionDepth == 0 && hasDeferredRefresh)
-            RefreshData();
+        {
+            audioChangeRefreshTimer.Stop();
+            audioChangeRefreshTimer.Start();
+        }
     }
 
     public Task ShowOrBringToFrontAsync()

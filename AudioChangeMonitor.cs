@@ -176,7 +176,8 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         var handler = new SessionEventsHandler(
             onSessionStateChanged: state => HandleSessionStateChanged(sessionId, state),
             onSessionDisconnected: () => RemoveSessionAndRaise(sessionId),
-            onMetadataChanged: RaiseChanged);
+            onMetadataChanged: RaiseChanged,
+            onVolumeChanged: RaiseChanged);
 
         session.RegisterEventClient(handler);
         sessionRegistrations.Add(sessionId, new SessionRegistration(sessionId, session, handler));
@@ -218,7 +219,12 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
     private void HandleSessionStateChanged(string sessionId, NAudioAudioSessionState state)
     {
         if (state == NAudioAudioSessionState.AudioSessionStateExpired)
+        {
             RemoveSessionAndRaise(sessionId);
+            return;
+        }
+
+        RaiseChanged();
     }
 
     private void RemoveSessionAndRaise(string sessionId)
@@ -352,12 +358,14 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         private readonly Action<NAudioAudioSessionState> onSessionStateChanged;
         private readonly Action onSessionDisconnected;
         private readonly Action onMetadataChanged;
+        private readonly Action onVolumeChanged;
 
-        public SessionEventsHandler(Action<NAudioAudioSessionState> onSessionStateChanged, Action onSessionDisconnected, Action onMetadataChanged)
+        public SessionEventsHandler(Action<NAudioAudioSessionState> onSessionStateChanged, Action onSessionDisconnected, Action onMetadataChanged, Action onVolumeChanged)
         {
             this.onSessionStateChanged = onSessionStateChanged;
             this.onSessionDisconnected = onSessionDisconnected;
             this.onMetadataChanged = onMetadataChanged;
+            this.onVolumeChanged = onVolumeChanged;
         }
 
         public void OnDisplayNameChanged(string displayName)
@@ -372,6 +380,7 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
 
         public void OnVolumeChanged(float volume, bool isMuted)
         {
+            onVolumeChanged();
         }
 
         public void OnChannelVolumeChanged(uint channelCount, IntPtr newVolumes, uint channelIndex)

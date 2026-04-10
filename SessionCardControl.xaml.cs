@@ -10,6 +10,7 @@ namespace AudioRoute;
 
 public sealed partial class SessionCardControl : UserControl
 {
+    private static readonly TimeSpan PendingVolumeSyncTimeout = TimeSpan.FromSeconds(5);
     private readonly DispatcherQueueTimer volumeCommitTimer;
     private MixerAppSessionInfo appSession;
     private IReadOnlyList<AudioDevice> devices;
@@ -20,6 +21,8 @@ public sealed partial class SessionCardControl : UserControl
     private bool isInteracting;
     private bool hasPendingVolumeCommit;
     private float lastCommittedVolume;
+    private float? pendingUiVolume;
+    private DateTimeOffset pendingUiVolumeUntil;
     private bool isMuted;
     private string? loadedIconPath;
     private int iconLoadVersion;
@@ -50,6 +53,12 @@ public sealed partial class SessionCardControl : UserControl
         devices = updatedDevices;
         volumeFlow = appSession.GetAvailableFlow(volumeFlow);
         ApplySession();
+    }
+
+    public void NotifyVolumeCommitFailed()
+    {
+        ClearPendingVolumeOverride();
+        lastCommittedVolume = VolumeSession?.Volume ?? lastCommittedVolume;
     }
 
     private MixerSessionInfo? VolumeSession => appSession.GetSession(volumeFlow);
@@ -93,6 +102,7 @@ public sealed partial class SessionCardControl : UserControl
         var volumeSession = VolumeSession;
         if (volumeSession is null)
         {
+            ClearPendingVolumeOverride();
             VolumeSlider.IsEnabled = false;
             MuteButton.IsEnabled = false;
             ToolTipService.SetToolTip(VolumeSlider, null);
@@ -106,10 +116,11 @@ public sealed partial class SessionCardControl : UserControl
 
         if (!isVolumeInteracting)
         {
+            var displayVolume = ResolveDisplayedVolume(volumeSession.Volume);
             updatingUi = true;
-            VolumeSlider.Value = Math.Clamp((int)Math.Round(volumeSession.Volume * 100), 0, 100);
+            VolumeSlider.Value = Math.Clamp((int)Math.Round(displayVolume * 100), 0, 100);
             updatingUi = false;
-            lastCommittedVolume = (float)(VolumeSlider.Value / 100d);
+            lastCommittedVolume = displayVolume;
             hasPendingVolumeCommit = false;
         }
 
@@ -287,16 +298,16 @@ public sealed partial class SessionCardControl : UserControl
 
     private void VolumeSlider_PointerReleased(object sender, PointerRoutedEventArgs e)
     {
+        CommitVolumeChange();
         isVolumeInteracting = false;
         UpdateInteractionState();
-        CommitVolumeChange();
     }
 
     private void VolumeSlider_PointerCaptureLost(object sender, PointerRoutedEventArgs e)
     {
+        CommitVolumeChange();
         isVolumeInteracting = false;
         UpdateInteractionState();
-        CommitVolumeChange();
     }
 
     private void VolumeSlider_ValueChanged(object sender, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e)
@@ -398,7 +409,33 @@ public sealed partial class SessionCardControl : UserControl
 
         hasPendingVolumeCommit = false;
         lastCommittedVolume = volume;
+        pendingUiVolume = volume;
+        pendingUiVolumeUntil = DateTimeOffset.UtcNow + PendingVolumeSyncTimeout;
         VolumeChanged?.Invoke(this, new MixerVolumeChangedEventArgs(volumeSession, volume));
+    }
+
+    private float ResolveDisplayedVolume(float snapshotVolume)
+    {
+        if (pendingUiVolume is not float optimisticVolume)
+            return snapshotVolume;
+
+        if (Math.Abs(snapshotVolume - optimisticVolume) < 0.01f)
+        {
+            ClearPendingVolumeOverride();
+            return snapshotVolume;
+        }
+
+        if (DateTimeOffset.UtcNow <= pendingUiVolumeUntil)
+            return optimisticVolume;
+
+        ClearPendingVolumeOverride();
+        return snapshotVolume;
+    }
+
+    private void ClearPendingVolumeOverride()
+    {
+        pendingUiVolume = null;
+        pendingUiVolumeUntil = default;
     }
 
     private void UpdateInteractionState()
