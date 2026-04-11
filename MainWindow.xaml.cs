@@ -56,6 +56,10 @@ public sealed partial class MainWindow : Window
     private readonly ShellNotifyIconHost trayIconHost;
     private readonly Dictionary<string, SessionCardControl> sessionCards = new(StringComparer.OrdinalIgnoreCase);
     private readonly object masterVolumeUpdateSync = new();
+    private readonly object sessionVolumeUpdateSync = new();
+    private readonly object sessionVolumeCommitSync = new();
+    private readonly Dictionary<string, ObservedSessionVolumeChangedEventArgs> pendingObservedSessionVolumeChanges = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, PendingSessionVolumeCommit> pendingSessionVolumeCommits = new(StringComparer.OrdinalIgnoreCase);
     private AppWindow? appWindow;
     private IntPtr hwnd;
     private bool allowDeactivateHide;
@@ -81,6 +85,8 @@ public sealed partial class MainWindow : Window
     private RefreshSessionScope scheduledRefreshScope = RefreshSessionScope.None;
     private Task? latestRefreshTask;
     private bool isMasterVolumeUpdateQueued;
+    private bool isSessionVolumeUpdateQueued;
+    private bool isSessionVolumeCommitFlushRunning;
     private bool isMasterVolumePollInFlight;
     private long lastObservedMasterVolumeEventTick;
     private WinEventDelegate? foregroundEventDelegate;
@@ -244,7 +250,22 @@ public sealed partial class MainWindow : Window
         if (isExitRequested)
             return;
 
-        DispatcherQueue.TryEnqueue(() => HandleObservedSessionVolumeChanged(e));
+        lock (sessionVolumeUpdateSync)
+        {
+            pendingObservedSessionVolumeChanges[CreateSessionFlowKey(e.SessionKey, e.Flow)] = e;
+            if (isSessionVolumeUpdateQueued)
+                return;
+
+            isSessionVolumeUpdateQueued = true;
+        }
+
+        if (!DispatcherQueue.TryEnqueue(DispatcherQueuePriority.High, FlushObservedSessionVolumeChanged))
+        {
+            lock (sessionVolumeUpdateSync)
+            {
+                isSessionVolumeUpdateQueued = false;
+            }
+        }
     }
 
     private void OnObservedMasterVolumeChanged(object? sender, ObservedMasterVolumeChangedEventArgs e)
@@ -322,6 +343,26 @@ public sealed partial class MainWindow : Window
             card.ApplyObservedVolume(e.Flow, e.Volume, e.IsMuted);
     }
 
+    private void FlushObservedSessionVolumeChanged()
+    {
+        List<ObservedSessionVolumeChangedEventArgs> pendingChanges;
+        lock (sessionVolumeUpdateSync)
+        {
+            if (pendingObservedSessionVolumeChanges.Count == 0)
+            {
+                isSessionVolumeUpdateQueued = false;
+                return;
+            }
+
+            pendingChanges = pendingObservedSessionVolumeChanges.Values.ToList();
+            pendingObservedSessionVolumeChanges.Clear();
+            isSessionVolumeUpdateQueued = false;
+        }
+
+        foreach (var change in pendingChanges)
+            HandleObservedSessionVolumeChanged(change);
+    }
+
     private void HandleObservedMasterVolumeChanged(ObservedMasterVolumeChangedEventArgs e)
     {
         if (isExitRequested || !trayIconHost.IsCreated)
@@ -342,6 +383,11 @@ public sealed partial class MainWindow : Window
         }
 
         HandleObservedMasterVolumeChanged(new ObservedMasterVolumeChangedEventArgs(currentState));
+    }
+
+    private static string CreateSessionFlowKey(string sessionKey, EDataFlow flow)
+    {
+        return $"{(int)flow}:{sessionKey}";
     }
 
     private void HandleObservedSessionDisplayNameChanged(ObservedSessionDisplayNameChangedEventArgs e)
@@ -727,27 +773,105 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private async void OnVolumeChanged(object? sender, MixerVolumeChangedEventArgs e)
+    private void OnVolumeChanged(object? sender, MixerVolumeChangedEventArgs e)
     {
-        try
+        var shouldStartFlush = false;
+        lock (sessionVolumeCommitSync)
         {
-            await refreshDispatcher.InvokeAsync(() =>
+            pendingSessionVolumeCommits[CreateSessionFlowKey(e.Session.SessionKey, e.Session.Flow)] =
+                new PendingSessionVolumeCommit(e, sender as SessionCardControl);
+
+            if (!isSessionVolumeCommitFlushRunning)
             {
-                AudioSessionService.SetSessionVolume(e.Session.SessionKey, e.Session.Flow, e.Volume);
-            });
-
-            UpdateCachedSessionVolume(e.Session.SessionKey, e.Session.Flow, e.Volume, isMuted: e.Volume <= 0.005f);
+                isSessionVolumeCommitFlushRunning = true;
+                shouldStartFlush = true;
+            }
         }
-        catch (Exception ex)
-        {
-            if (sender is SessionCardControl card)
-                card.NotifyVolumeCommitFailed();
 
-            RuntimeLog.Write($"主页调节音量: failed session={e.Session.SessionKey}, flow={e.Session.Flow}, message={ex.Message}");
-            Trace.WriteLine($"[AudioRoute] 调整音量失败: {ex}");
+        if (shouldStartFlush)
+            _ = FlushPendingSessionVolumeCommitsAsync();
+    }
+
+    private async Task FlushPendingSessionVolumeCommitsAsync()
+    {
+        while (!isExitRequested)
+        {
+            List<PendingSessionVolumeCommit> pendingCommits;
+            lock (sessionVolumeCommitSync)
+            {
+                if (pendingSessionVolumeCommits.Count == 0)
+                {
+                    isSessionVolumeCommitFlushRunning = false;
+                    return;
+                }
+
+                pendingCommits = pendingSessionVolumeCommits.Values.ToList();
+                pendingSessionVolumeCommits.Clear();
+            }
+
+            SessionVolumeCommitBatchResult result;
+            try
+            {
+                result = await refreshDispatcher.InvokeAsync(() =>
+                {
+                    var succeeded = new List<PendingSessionVolumeCommit>(pendingCommits.Count);
+                    var failures = new List<SessionVolumeCommitFailure>();
+
+                    foreach (var pendingCommit in pendingCommits)
+                    {
+                        try
+                        {
+                            var change = pendingCommit.Change;
+                            var updated = false;
+                            try
+                            {
+                                updated = audioChangeMonitor.TrySetSessionVolume(change.Session.SessionKey, change.Session.Flow, change.Volume);
+                            }
+                            catch (Exception ex)
+                            {
+                                Trace.WriteLine($"[AudioRoute] 快速调节音量路径失败，回退到枚举路径: {ex}");
+                            }
+
+                            if (!updated)
+                                AudioSessionService.SetSessionVolume(change.Session.SessionKey, change.Session.Flow, change.Volume);
+
+                            succeeded.Add(pendingCommit);
+                        }
+                        catch (Exception ex)
+                        {
+                            failures.Add(new SessionVolumeCommitFailure(pendingCommit, ex));
+                        }
+                    }
+
+                    return new SessionVolumeCommitBatchResult(succeeded, failures);
+                });
+            }
+            catch (Exception ex)
+            {
+                result = new SessionVolumeCommitBatchResult(
+                    Array.Empty<PendingSessionVolumeCommit>(),
+                    pendingCommits.Select(commit => new SessionVolumeCommitFailure(commit, ex)).ToArray());
+            }
+
+            foreach (var succeededCommit in result.Succeeded)
+            {
+                var change = succeededCommit.Change;
+                UpdateCachedSessionVolume(change.Session.SessionKey, change.Session.Flow, change.Volume, isMuted: change.Volume <= 0.005f);
+            }
+
+            if (result.Failures.Count == 0)
+                continue;
+
+            foreach (var failure in result.Failures)
+            {
+                failure.Commit.SourceCard?.NotifyVolumeCommitFailed();
+                RuntimeLog.Write($"主页调节音量: failed session={failure.Commit.Change.Session.SessionKey}, flow={failure.Commit.Change.Session.Flow}, message={failure.Exception.Message}");
+                Trace.WriteLine($"[AudioRoute] 调整音量失败: {failure.Exception}");
+            }
+
             hasDeferredRefresh = true;
             RefreshData();
-            ShowError($"调整音量失败: {ex.Message}");
+            ShowError($"调整音量失败: {result.Failures[0].Exception.Message}");
         }
     }
 
@@ -1070,6 +1194,7 @@ public sealed partial class MainWindow : Window
         }
 
         NativeMethods.ApplyToolWindowStyle(hwnd);
+        NativeMethods.ApplyWindowCornerPreference(hwnd);
         AttachWindowProc();
         appWindow.Resize(new SizeInt32(PanelWidth, PanelHeight));
         UpdateWindowPosition();
@@ -1888,6 +2013,8 @@ public sealed partial class MainWindow : Window
         private const int WsExToolWindow = 0x00000080;
         private const int WsThickFrame = 0x00040000;
         private const uint DwmaCloak = 13;
+        private const uint DwmaWindowCornerPreference = 33;
+        private const int DwmWindowCornerPreferenceRound = 2;
         public const int SwHide = 0;
         public const int SwShow = 5;
         public const uint WaInactive = 0;
@@ -1952,6 +2079,12 @@ public sealed partial class MainWindow : Window
         {
             var value = cloaked ? 1 : 0;
             _ = DwmSetWindowAttribute(hwnd, DwmaCloak, ref value, Marshal.SizeOf<int>());
+        }
+
+        public static void ApplyWindowCornerPreference(IntPtr hwnd)
+        {
+            var value = DwmWindowCornerPreferenceRound;
+            _ = DwmSetWindowAttribute(hwnd, DwmaWindowCornerPreference, ref value, Marshal.SizeOf<int>());
         }
 
         public static IntPtr SetWindowProc(IntPtr hwnd, IntPtr windowProc)
@@ -2066,6 +2199,11 @@ public sealed partial class MainWindow : Window
     }
 
     private sealed record PanelSnapshot(IReadOnlyList<AudioDevice> Devices, IReadOnlyList<MixerAppSessionInfo> Sessions);
+    private sealed record PendingSessionVolumeCommit(MixerVolumeChangedEventArgs Change, SessionCardControl? SourceCard);
+    private sealed record SessionVolumeCommitFailure(PendingSessionVolumeCommit Commit, Exception Exception);
+    private sealed record SessionVolumeCommitBatchResult(
+        IReadOnlyList<PendingSessionVolumeCommit> Succeeded,
+        IReadOnlyList<SessionVolumeCommitFailure> Failures);
 
     private delegate void WinEventDelegate(
         IntPtr hWinEventHook,

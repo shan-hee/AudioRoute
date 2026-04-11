@@ -1,7 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
@@ -11,7 +10,6 @@ namespace AudioRoute;
 public sealed partial class SessionCardControl : UserControl
 {
     private static readonly TimeSpan PendingVolumeSyncTimeout = TimeSpan.FromSeconds(5);
-    private readonly DispatcherQueueTimer volumeCommitTimer;
     private MixerAppSessionInfo appSession;
     private IReadOnlyList<AudioDevice> devices;
     private EDataFlow volumeFlow;
@@ -34,11 +32,6 @@ public sealed partial class SessionCardControl : UserControl
         this.devices = devices;
         volumeFlow = appSession.GetAvailableFlow(EDataFlow.eRender);
         InitializeComponent();
-
-        volumeCommitTimer = DispatcherQueue.GetForCurrentThread().CreateTimer();
-        volumeCommitTimer.Interval = TimeSpan.FromMilliseconds(160);
-        volumeCommitTimer.Tick += VolumeCommitTimer_Tick;
-
         ApplySession();
     }
 
@@ -80,15 +73,14 @@ public sealed partial class SessionCardControl : UserControl
             return;
         }
 
-        volumeCommitTimer.Stop();
-        ClearPendingVolumeOverride();
+        var displayVolume = ResolveDisplayedVolume(volume);
         hasPendingVolumeCommit = false;
-        lastCommittedVolume = volume;
-        if (volume > 0.005f)
-            lastAudibleVolume = volume;
+        lastCommittedVolume = displayVolume;
+        if (displayVolume > 0.005f)
+            lastAudibleVolume = displayVolume;
         isMuted = muted;
         updatingUi = true;
-        VolumeSlider.Value = Math.Clamp((int)Math.Round(volume * 100), 0, 100);
+        VolumeSlider.Value = Math.Clamp((int)Math.Round(displayVolume * 100), 0, 100);
         updatingUi = false;
         UpdateMuteIcon();
         UpdateVolumeText();
@@ -102,7 +94,9 @@ public sealed partial class SessionCardControl : UserControl
         ProcessTextBlock.Text = appSession.IsSystemSession
             ? "系统音频会话"
             : $"{appSession.ProcessName} | PID {appSession.ProcessId}";
-        SessionFallbackIcon.Glyph = appSession.IsSystemSession ? "\uE7F5" : "\uE77B";
+        SessionFallbackIcon.Glyph = appSession.IsSystemSession
+            ? "\uE7F5"
+            : "\uE77B";
 
         ToolTipService.SetToolTip(TitleTextBlock, appSession.DisplayName);
 
@@ -336,8 +330,7 @@ public sealed partial class SessionCardControl : UserControl
             return;
 
         hasPendingVolumeCommit = true;
-        volumeCommitTimer.Stop();
-        volumeCommitTimer.Start();
+        CommitVolumeChange();
     }
 
     private void UpdateVolumeText()
@@ -398,15 +391,8 @@ public sealed partial class SessionCardControl : UserControl
         SessionIconImage.Visibility = Visibility.Visible;
     }
 
-    private void VolumeCommitTimer_Tick(object? sender, object e)
-    {
-        CommitVolumeChange();
-    }
-
     private void CommitVolumeChange()
     {
-        volumeCommitTimer.Stop();
-
         if (!hasPendingVolumeCommit)
             return;
 

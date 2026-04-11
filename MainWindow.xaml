@@ -6,10 +6,9 @@
     <Window.SystemBackdrop>
         <DesktopAcrylicBackdrop />
     </Window.SystemBackdrop>
-    <Grid x:Name="WindowRoot" Background="Transparent" RequestedTheme="Dark">
+        <Grid x:Name="WindowRoot" Background="Transparent" RequestedTheme="Dark">
         <Grid.Resources>
-            <SolidColorBrush x:Key="PanelBackgroundBrush" Color="#F12B2B2B" />
-            <SolidColorBrush x:Key="PanelBorderBrush" Color="#1AFFFFFF" />
+            <SolidColorBrush x:Key="PanelBackgroundBrush" Color="#FF2B2B2B" />
         </Grid.Resources>
 
         <Border x:Name="PanelSurface"
@@ -17,8 +16,7 @@
                 HorizontalAlignment="Stretch"
                 VerticalAlignment="Stretch"
                 Background="{StaticResource PanelBackgroundBrush}"
-                BorderBrush="{StaticResource PanelBorderBrush}"
-                BorderThickness="1"
+                BorderThickness="0"
                 CornerRadius="12">
             <ScrollViewer Margin="8,8,0,8"
                           VerticalScrollBarVisibility="Visible"
