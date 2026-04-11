@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using NAudio.CoreAudioApi;
 using NAudio.CoreAudioApi.Interfaces;
 using NAudioAudioSessionState = NAudio.CoreAudioApi.Interfaces.AudioSessionState;
@@ -67,6 +68,7 @@ internal sealed class ObservedSessionStructureChangedEventArgs : EventArgs
 
 internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
 {
+    private readonly object rebuildSync = new();
     private readonly object syncRoot = new();
     private readonly MMDeviceEnumerator deviceEnumerator = new();
     private readonly List<DeviceRegistration> deviceRegistrations = new();
@@ -95,6 +97,16 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         if (disposed)
             return false;
 
+        if (TrySetSessionVolumeCore(sessionKey, flow, volume))
+            return true;
+
+        RebuildSubscriptions();
+
+        return TrySetSessionVolumeCore(sessionKey, flow, volume);
+    }
+
+    private bool TrySetSessionVolumeCore(string sessionKey, EDataFlow flow, float volume)
+    {
         List<SessionRegistration>? matchingRegistrations = null;
         var clampedVolume = Math.Clamp(volume, 0f, 1f);
 
@@ -157,8 +169,18 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
             Trace.WriteLine($"[AudioRoute] Failed to unregister endpoint notifications: {ex}");
         }
 
+        DefaultRenderEndpointRegistration? previousDefaultRegistration;
+        List<SessionRegistration> previousSessionRegistrations;
+        List<DeviceRegistration> previousDeviceRegistrations;
         lock (syncRoot)
-            ClearRegistrationsCore();
+        {
+            DetachRegistrationsCore(
+                out previousDefaultRegistration,
+                out previousSessionRegistrations,
+                out previousDeviceRegistrations);
+        }
+
+        DisposeRegistrations(previousDefaultRegistration, previousSessionRegistrations, previousDeviceRegistrations);
 
         deviceEnumerator.Dispose();
     }
@@ -166,31 +188,34 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
     void IMMNotificationClient.OnDefaultDeviceChanged(NAudioDataFlow flow, Role role, string defaultDeviceId)
     {
         Trace.WriteLine($"[AudioRoute] Default device changed: flow={flow}, role={role}, id={defaultDeviceId}");
+        RuntimeLog.Write($"默认设备变化: flow={flow}, role={role}, id={defaultDeviceId}");
         HandleDeviceTopologyChanged();
     }
 
     void IMMNotificationClient.OnDeviceAdded(string pwstrDeviceId)
     {
         Trace.WriteLine($"[AudioRoute] Device added: id={pwstrDeviceId}");
+        RuntimeLog.Write($"设备新增: id={pwstrDeviceId}");
         HandleDeviceTopologyChanged();
     }
 
     void IMMNotificationClient.OnDeviceRemoved(string deviceId)
     {
         Trace.WriteLine($"[AudioRoute] Device removed: id={deviceId}");
+        RuntimeLog.Write($"设备移除: id={deviceId}");
         HandleDeviceTopologyChanged();
     }
 
     void IMMNotificationClient.OnDeviceStateChanged(string deviceId, NAudioDeviceState newState)
     {
         Trace.WriteLine($"[AudioRoute] Device state changed: id={deviceId}, state={newState}");
+        RuntimeLog.Write($"设备状态变化: id={deviceId}, state={newState}");
         HandleDeviceTopologyChanged();
     }
 
     void IMMNotificationClient.OnPropertyValueChanged(string pwstrDeviceId, NAudioPropertyKey key)
     {
         Trace.WriteLine($"[AudioRoute] Device property changed: id={pwstrDeviceId}");
-        HandleDeviceTopologyChanged();
     }
 
     private void HandleDeviceTopologyChanged()
@@ -198,23 +223,45 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         if (disposed)
             return;
 
+        RuntimeLog.Write("监听器拓扑变化: begin");
         DeviceEnumerator.InvalidateCache();
-
-        lock (syncRoot)
-            RebuildSubscriptionsCore();
-
+        RebuildSubscriptions();
         RaiseChanged();
+        RuntimeLog.Write("监听器拓扑变化: done");
     }
 
     private void RebuildSubscriptions()
     {
-        lock (syncRoot)
+        lock (rebuildSync)
+        {
+            if (disposed)
+                return;
+
+            DefaultRenderEndpointRegistration? previousDefaultRegistration;
+            List<SessionRegistration> previousSessionRegistrations;
+            List<DeviceRegistration> previousDeviceRegistrations;
+
+            lock (syncRoot)
+            {
+                DetachRegistrationsCore(
+                    out previousDefaultRegistration,
+                    out previousSessionRegistrations,
+                    out previousDeviceRegistrations);
+            }
+
+            DisposeRegistrations(previousDefaultRegistration, previousSessionRegistrations, previousDeviceRegistrations);
+
+            if (disposed)
+                return;
+
+            RuntimeLog.Write("监听器重建订阅: rebuilding");
             RebuildSubscriptionsCore();
+            RuntimeLog.Write("监听器重建订阅: rebuilt");
+        }
     }
 
     private void RebuildSubscriptionsCore()
     {
-        ClearRegistrationsCore();
         RebuildDefaultRenderEndpointRegistrationCore();
         RegisterFlowCore(NAudioDataFlow.Render);
         RegisterFlowCore(NAudioDataFlow.Capture);
@@ -222,8 +269,7 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
 
     private void RebuildDefaultRenderEndpointRegistrationCore()
     {
-        defaultRenderEndpointRegistration?.Dispose();
-        defaultRenderEndpointRegistration = null;
+        DefaultRenderEndpointRegistration? nextRegistration = null;
 
         try
         {
@@ -233,12 +279,26 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
                 HandleMasterVolumeNotification(notification.MasterVolume, notification.Muted);
 
             endpointVolume.OnVolumeNotification += notificationHandler;
-            defaultRenderEndpointRegistration = new DefaultRenderEndpointRegistration(device, endpointVolume, notificationHandler);
+            nextRegistration = new DefaultRenderEndpointRegistration(device, endpointVolume, notificationHandler);
         }
         catch (Exception ex)
         {
             Trace.WriteLine($"[AudioRoute] Failed to register default render endpoint volume watcher: {ex}");
         }
+
+        lock (syncRoot)
+        {
+            if (disposed)
+            {
+                nextRegistration?.Dispose();
+                return;
+            }
+
+            defaultRenderEndpointRegistration = nextRegistration;
+            nextRegistration = null;
+        }
+
+        nextRegistration?.Dispose();
 
         RaiseMasterVolumeChanged(MasterVolumeService.TryGetMasterVolumeState());
     }
@@ -268,7 +328,24 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
                     sessionManager.OnSessionCreated += deviceRegistration.SessionCreatedHandler;
                     sessionManager.RefreshSessions();
 
-                    deviceRegistrations.Add(deviceRegistration);
+                    var keepDeviceRegistration = false;
+                    lock (syncRoot)
+                    {
+                        if (!disposed)
+                        {
+                            deviceRegistrations.Add(deviceRegistration);
+                            keepDeviceRegistration = true;
+                        }
+                    }
+
+                    if (!keepDeviceRegistration)
+                    {
+                        deviceRegistration.Dispose();
+                        device = null;
+                        sessionManager = null;
+                        continue;
+                    }
+
                     device = null;
                     sessionManager = null;
 
@@ -312,10 +389,14 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
             return false;
 
         var sessionId = GetSessionIdentity(session);
-        if (sessionRegistrations.ContainsKey(sessionId))
-            return false;
-
         var sessionKey = GetAppSessionKey(session);
+
+        lock (syncRoot)
+        {
+            if (disposed || sessionRegistrations.ContainsKey(sessionId))
+                return false;
+        }
+
         var handler = new SessionEventsHandler(
             onSessionStateChanged: state => HandleSessionStateChanged(sessionId, flow, state),
             onSessionDisconnected: () => RemoveSessionAndRaiseStructureChanged(sessionId, flow),
@@ -323,8 +404,22 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
             onVolumeChanged: (volume, isMuted) => HandleSessionVolumeChanged(sessionKey, flow, volume, isMuted));
 
         session.RegisterEventClient(handler);
-        sessionRegistrations.Add(sessionId, new SessionRegistration(sessionId, sessionKey, flow, session, handler));
-        return true;
+        var registration = new SessionRegistration(sessionId, sessionKey, flow, session, handler);
+        var added = false;
+
+        lock (syncRoot)
+        {
+            if (!disposed && !sessionRegistrations.ContainsKey(sessionId))
+            {
+                sessionRegistrations.Add(sessionId, registration);
+                added = true;
+            }
+        }
+
+        if (!added)
+            registration.Dispose();
+
+        return added;
     }
 
     private void HandleSessionCreated(EDataFlow flow, object? sender, IAudioSessionControl newSessionControl)
@@ -336,13 +431,10 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         {
             session = new AudioSessionControl(newSessionControl);
 
-            lock (syncRoot)
+            if (TryTrackSessionCore(session, flow))
             {
-                if (TryTrackSessionCore(session, flow))
-                {
-                    session = null;
-                    shouldRaise = true;
-                }
+                session = null;
+                shouldRaise = true;
             }
         }
         catch (Exception ex)
@@ -391,34 +483,50 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
 
     private void RemoveSessionAndRaiseStructureChanged(string sessionId, EDataFlow flow)
     {
+        SessionRegistration? removedRegistration;
         lock (syncRoot)
-            RemoveSessionCore(sessionId);
+            removedRegistration = RemoveSessionCore(sessionId);
+
+        removedRegistration?.Dispose();
 
         RaiseSessionStructureChanged(flow);
     }
 
-    private void RemoveSessionCore(string sessionId)
+    private SessionRegistration? RemoveSessionCore(string sessionId)
     {
         if (!sessionRegistrations.Remove(sessionId, out var registration))
-            return;
+            return null;
 
-        registration.Dispose();
+        return registration;
     }
 
-    private void ClearRegistrationsCore()
+    private void DetachRegistrationsCore(
+        out DefaultRenderEndpointRegistration? previousDefaultRegistration,
+        out List<SessionRegistration> previousSessionRegistrations,
+        out List<DeviceRegistration> previousDeviceRegistrations)
     {
-        defaultRenderEndpointRegistration?.Dispose();
+        previousDefaultRegistration = defaultRenderEndpointRegistration;
         defaultRenderEndpointRegistration = null;
 
-        foreach (var registration in sessionRegistrations.Values)
-            registration.Dispose();
-
+        previousSessionRegistrations = sessionRegistrations.Values.ToList();
         sessionRegistrations.Clear();
 
-        foreach (var registration in deviceRegistrations)
+        previousDeviceRegistrations = deviceRegistrations.ToList();
+        deviceRegistrations.Clear();
+    }
+
+    private static void DisposeRegistrations(
+        DefaultRenderEndpointRegistration? previousDefaultRegistration,
+        IReadOnlyList<SessionRegistration> previousSessionRegistrations,
+        IReadOnlyList<DeviceRegistration> previousDeviceRegistrations)
+    {
+        previousDefaultRegistration?.Dispose();
+
+        foreach (var registration in previousSessionRegistrations)
             registration.Dispose();
 
-        deviceRegistrations.Clear();
+        foreach (var registration in previousDeviceRegistrations)
+            registration.Dispose();
     }
 
     private void RaiseChanged()

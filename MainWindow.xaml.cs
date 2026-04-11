@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.UI.Composition;
 using Microsoft.UI.Dispatching;
@@ -30,23 +31,31 @@ public sealed partial class MainWindow : Window
     private static readonly TimeSpan SnapshotRefreshWhileVisibleAge = TimeSpan.FromMinutes(3);
     private static readonly TimeSpan AudioChangeRefreshDebounceInterval = TimeSpan.FromMilliseconds(350);
     private static readonly TimeSpan InitialSnapshotWarmupWait = TimeSpan.FromMilliseconds(160);
+    private static readonly TimeSpan MasterVolumePollInterval = TimeSpan.FromMilliseconds(400);
+    private static readonly TimeSpan MasterVolumePollQuietWindow = TimeSpan.FromMilliseconds(900);
     private static readonly TimeSpan PanelOpenOffsetAnimationDuration = TimeSpan.FromMilliseconds(240);
     private static readonly TimeSpan PanelOpenOpacityAnimationDuration = TimeSpan.FromMilliseconds(220);
     private static readonly TimeSpan PanelCloseOffsetAnimationDuration = TimeSpan.FromMilliseconds(120);
     private static readonly TimeSpan PanelCloseOpacityAnimationDuration = TimeSpan.FromMilliseconds(100);
+    private static readonly Guid TrayIconGuid = new("05F26E47-7F95-4C1C-B0E6-4D748C6CFB6F");
     private const uint TrayIconId = 1;
     private const uint TrayCallbackMessage = NativeMethods.WmApp + 1;
     private const uint HomeTrayMenuItemId = 1001;
     private const uint ExitTrayMenuItemId = 1002;
     private const uint StartupTrayMenuItemId = 1003;
+    private const uint ViewLogTrayMenuItemId = 1004;
 
     private readonly DispatcherQueueTimer deactivateHideTimer;
     private readonly DispatcherQueueTimer foregroundMonitorTimer;
     private readonly DispatcherQueueTimer refreshTimer;
     private readonly DispatcherQueueTimer audioChangeRefreshTimer;
+    private readonly DispatcherQueueTimer masterVolumePollTimer;
     private readonly StaThreadDispatcher refreshDispatcher;
+    private readonly StaThreadDispatcher trayDispatcher;
     private readonly AudioChangeMonitor audioChangeMonitor;
+    private readonly ShellNotifyIconHost trayIconHost;
     private readonly Dictionary<string, SessionCardControl> sessionCards = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object masterVolumeUpdateSync = new();
     private AppWindow? appWindow;
     private IntPtr hwnd;
     private bool allowDeactivateHide;
@@ -58,11 +67,11 @@ public sealed partial class MainWindow : Window
     private bool hasDeferredRefresh;
     private bool deferredRefreshCanReuseDevices;
     private RefreshSessionScope deferredRefreshScope = RefreshSessionScope.None;
-    private bool isTrayIconCreated;
     private bool isSnapshotStale = true;
     private DateTimeOffset lastPrimaryTrayInvokeAt;
     private DateTimeOffset suppressPrimaryTrayInvokeUntil;
     private MasterVolumeState? lastTrayVolumeState;
+    private MasterVolumeState? pendingObservedMasterVolumeState;
     private PanelSnapshot? lastSnapshot;
     private DateTimeOffset lastSnapshotUpdatedAt;
     private DateTimeOffset suppressHideUntil;
@@ -71,6 +80,9 @@ public sealed partial class MainWindow : Window
     private bool scheduledRefreshCanReuseDevices;
     private RefreshSessionScope scheduledRefreshScope = RefreshSessionScope.None;
     private Task? latestRefreshTask;
+    private bool isMasterVolumeUpdateQueued;
+    private bool isMasterVolumePollInFlight;
+    private long lastObservedMasterVolumeEventTick;
     private WinEventDelegate? foregroundEventDelegate;
     private IntPtr foregroundEventHook;
     private WndProcDelegate? windowProcDelegate;
@@ -78,8 +90,16 @@ public sealed partial class MainWindow : Window
 
     public MainWindow()
     {
+        RuntimeLog.Reset();
+        RuntimeLog.Write("应用启动");
+        Interlocked.Exchange(ref lastObservedMasterVolumeEventTick, Environment.TickCount64);
         InitializeComponent();
         refreshDispatcher = new StaThreadDispatcher("AudioRoute.Refresh");
+        trayDispatcher = new StaThreadDispatcher("AudioRoute.Tray");
+        trayIconHost = new ShellNotifyIconHost(TrayIconGuid, TrayIconId, TrayCallbackMessage);
+        trayIconHost.MessageReceived += OnTrayIconMessageReceived;
+        trayIconHost.TaskbarCreated += OnTrayIconTaskbarCreated;
+        trayIconHost.EnvironmentChanged += OnTrayIconEnvironmentChanged;
         ConfigureWindow();
 
         Activated += OnWindowActivated;
@@ -128,6 +148,37 @@ public sealed partial class MainWindow : Window
                 RefreshData(canReuseDevices, scope);
         };
 
+        masterVolumePollTimer = DispatcherQueue.GetForCurrentThread().CreateTimer();
+        masterVolumePollTimer.Interval = MasterVolumePollInterval;
+        masterVolumePollTimer.IsRepeating = true;
+        masterVolumePollTimer.Tick += async (_, _) =>
+        {
+            if (isExitRequested || !trayIconHost.IsCreated || isMasterVolumePollInFlight)
+                return;
+
+            if (Environment.TickCount64 - Interlocked.Read(ref lastObservedMasterVolumeEventTick) < (long)MasterVolumePollQuietWindow.TotalMilliseconds)
+                return;
+
+            isMasterVolumePollInFlight = true;
+            try
+            {
+                var polledState = await trayDispatcher.InvokeAsync(MasterVolumeService.TryGetMasterVolumeState);
+                if (!isExitRequested && trayIconHost.IsCreated && ShouldQueueTrayIconUpdate(polledState))
+                {
+                    RuntimeLog.Write($"主音量轮询命中: state={FormatMasterVolumeStateForLog(polledState)}");
+                    ScheduleTrayIconUpdate(polledState, force: true);
+                }
+            }
+            catch (Exception ex)
+            {
+                Trace.WriteLine($"[AudioRoute] 主音量轮询失败: {ex}");
+            }
+            finally
+            {
+                isMasterVolumePollInFlight = false;
+            }
+        };
+
         audioChangeMonitor = new AudioChangeMonitor();
         audioChangeMonitor.Changed += OnAudioEnvironmentChanged;
         audioChangeMonitor.SessionStructureChanged += OnObservedSessionStructureChanged;
@@ -160,6 +211,7 @@ public sealed partial class MainWindow : Window
         isConfigured = true;
         AttachForegroundEventHook();
         InitializeTrayIcon();
+        masterVolumePollTimer.Start();
         RefreshData();
     }
 
@@ -200,7 +252,24 @@ public sealed partial class MainWindow : Window
         if (isExitRequested)
             return;
 
-        DispatcherQueue.TryEnqueue(() => HandleObservedMasterVolumeChanged(e));
+        Interlocked.Exchange(ref lastObservedMasterVolumeEventTick, Environment.TickCount64);
+
+        lock (masterVolumeUpdateSync)
+        {
+            pendingObservedMasterVolumeState = e.State;
+            if (isMasterVolumeUpdateQueued)
+                return;
+
+            isMasterVolumeUpdateQueued = true;
+        }
+
+        if (!DispatcherQueue.TryEnqueue(DispatcherQueuePriority.High, FlushObservedMasterVolumeChanged))
+        {
+            lock (masterVolumeUpdateSync)
+            {
+                isMasterVolumeUpdateQueued = false;
+            }
+        }
     }
 
     private void OnObservedSessionDisplayNameChanged(object? sender, ObservedSessionDisplayNameChangedEventArgs e)
@@ -255,10 +324,24 @@ public sealed partial class MainWindow : Window
 
     private void HandleObservedMasterVolumeChanged(ObservedMasterVolumeChangedEventArgs e)
     {
-        if (isExitRequested || !isTrayIconCreated)
+        if (isExitRequested || !trayIconHost.IsCreated)
             return;
 
-        UpdateTrayIcon(e.State);
+        if (ShouldQueueTrayIconUpdate(e.State))
+            ScheduleTrayIconUpdate(e.State, force: true);
+    }
+
+    private void FlushObservedMasterVolumeChanged()
+    {
+        MasterVolumeState? currentState;
+        lock (masterVolumeUpdateSync)
+        {
+            currentState = pendingObservedMasterVolumeState;
+            pendingObservedMasterVolumeState = null;
+            isMasterVolumeUpdateQueued = false;
+        }
+
+        HandleObservedMasterVolumeChanged(new ObservedMasterVolumeChangedEventArgs(currentState));
     }
 
     private void HandleObservedSessionDisplayNameChanged(ObservedSessionDisplayNameChangedEventArgs e)
@@ -644,12 +727,14 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private void OnVolumeChanged(object? sender, MixerVolumeChangedEventArgs e)
+    private async void OnVolumeChanged(object? sender, MixerVolumeChangedEventArgs e)
     {
         try
         {
-            if (!audioChangeMonitor.TrySetSessionVolume(e.Session.SessionKey, e.Session.Flow, e.Volume))
+            await refreshDispatcher.InvokeAsync(() =>
+            {
                 AudioSessionService.SetSessionVolume(e.Session.SessionKey, e.Session.Flow, e.Volume);
+            });
 
             UpdateCachedSessionVolume(e.Session.SessionKey, e.Session.Flow, e.Volume, isMuted: e.Volume <= 0.005f);
         }
@@ -658,6 +743,7 @@ public sealed partial class MainWindow : Window
             if (sender is SessionCardControl card)
                 card.NotifyVolumeCommitFailed();
 
+            RuntimeLog.Write($"主页调节音量: failed session={e.Session.SessionKey}, flow={e.Session.Flow}, message={ex.Message}");
             Trace.WriteLine($"[AudioRoute] 调整音量失败: {ex}");
             hasDeferredRefresh = true;
             RefreshData();
@@ -738,8 +824,9 @@ public sealed partial class MainWindow : Window
         audioChangeMonitor.MasterVolumeChanged -= OnObservedMasterVolumeChanged;
         audioChangeMonitor.SessionDisplayNameChanged -= OnObservedSessionDisplayNameChanged;
         audioChangeMonitor.Dispose();
-        refreshDispatcher.Dispose();
         DisposeTrayIcon();
+        trayDispatcher.Dispose();
+        refreshDispatcher.Dispose();
         TrayVolumeIconService.Dispose();
         AudioPolicyManager.Cleanup();
     }
@@ -995,35 +1082,29 @@ public sealed partial class MainWindow : Window
         if (hwnd == IntPtr.Zero)
             return;
 
-        if (isTrayIconCreated)
+        if (trayIconHost.IsCreated)
         {
             UpdateTrayIcon(force: true);
             return;
         }
 
-        lastTrayVolumeState = MasterVolumeService.TryGetMasterVolumeState();
-        var iconHandle = TrayVolumeIconService.GetIconHandle(lastTrayVolumeState?.IconKind ?? TrayVolumeIconKind.High);
-        var notifyIconData = CreateTrayIconData(iconHandle, BuildTrayToolTip(lastTrayVolumeState));
-
-        if (!NativeMethods.ShellNotifyIcon(NativeMethods.NimAdd, ref notifyIconData))
-            return;
-
-        notifyIconData.uVersionOrTimeout = NativeMethods.NotifyIconVersion4;
-        _ = NativeMethods.ShellNotifyIcon(NativeMethods.NimSetVersion, ref notifyIconData);
-        isTrayIconCreated = true;
-        UpdateTrayIcon(lastTrayVolumeState, force: true);
+        TrayVolumeIconService.RefreshEnvironment(force: true);
+        var currentState = MasterVolumeService.TryGetMasterVolumeState();
+        ApplyTrayIconUpdate(currentState, force: true);
     }
 
     private void DisposeTrayIcon()
     {
-        if (isTrayIconCreated)
+        masterVolumePollTimer.Stop();
+        isMasterVolumePollInFlight = false;
+        lock (masterVolumeUpdateSync)
         {
-            var notifyIconData = CreateTrayIconData();
-            _ = NativeMethods.ShellNotifyIcon(NativeMethods.NimDelete, ref notifyIconData);
-            isTrayIconCreated = false;
-            lastTrayVolumeState = null;
+            pendingObservedMasterVolumeState = null;
+            isMasterVolumeUpdateQueued = false;
         }
 
+        trayIconHost.Dispose();
+        lastTrayVolumeState = null;
         DetachWindowProc();
     }
 
@@ -1047,60 +1128,79 @@ public sealed partial class MainWindow : Window
         windowProcDelegate = null;
     }
 
-    private NativeMethods.NotifyIconData CreateTrayIconData()
-    {
-        return CreateTrayIconData(IntPtr.Zero, string.Empty);
-    }
-
-    private NativeMethods.NotifyIconData CreateTrayIconData(IntPtr iconHandle, string toolTip)
-    {
-        var flags = NativeMethods.NifMessage;
-
-        if (iconHandle != IntPtr.Zero)
-            flags |= NativeMethods.NifIcon;
-
-        if (!string.IsNullOrWhiteSpace(toolTip))
-            flags |= NativeMethods.NifTip | NativeMethods.NifShowTip;
-
-        return new NativeMethods.NotifyIconData
-        {
-            cbSize = (uint)Marshal.SizeOf<NativeMethods.NotifyIconData>(),
-            hWnd = hwnd,
-            uID = TrayIconId,
-            uFlags = flags,
-            uCallbackMessage = TrayCallbackMessage,
-            hIcon = iconHandle,
-            szTip = toolTip,
-            szInfo = string.Empty,
-            szInfoTitle = string.Empty,
-            uVersionOrTimeout = 0
-        };
-    }
-
     private void UpdateTrayIcon(bool force = false)
     {
-        UpdateTrayIcon(MasterVolumeService.TryGetMasterVolumeState(), force);
+        ScheduleTrayIconUpdate(MasterVolumeService.TryGetMasterVolumeState(), force);
     }
 
     private void UpdateTrayIcon(MasterVolumeState? currentState, bool force = false)
     {
-        if (!isTrayIconCreated)
+        ScheduleTrayIconUpdate(currentState, force);
+    }
+
+    private bool ShouldQueueTrayIconUpdate(MasterVolumeState? currentState)
+    {
+        return !EqualityComparer<MasterVolumeState?>.Default.Equals(currentState, lastTrayVolumeState);
+    }
+
+    private void ScheduleTrayIconUpdate(MasterVolumeState? currentState, bool force = false)
+    {
+        if (!trayIconHost.IsCreated && !force)
+            return;
+
+        if (!force && !ShouldQueueTrayIconUpdate(currentState))
+            return;
+
+        ApplyTrayIconUpdate(currentState, force);
+    }
+
+    private void ApplyTrayIconUpdate(MasterVolumeState? currentState, bool force)
+    {
+        if (!trayIconHost.IsCreated && !force)
             return;
 
         if (!force && EqualityComparer<MasterVolumeState?>.Default.Equals(currentState, lastTrayVolumeState))
             return;
 
-        lastTrayVolumeState = currentState;
+        try
+        {
+            var wasCreated = trayIconHost.IsCreated;
+            var iconHandle = TrayVolumeIconService.GetIconHandle(currentState?.IconKind ?? TrayVolumeIconKind.NoDevice);
+            if (iconHandle == IntPtr.Zero)
+                return;
 
-        var iconHandle = TrayVolumeIconService.GetIconHandle(currentState?.IconKind ?? TrayVolumeIconKind.High);
-        var notifyIconData = CreateTrayIconData(iconHandle, BuildTrayToolTip(currentState));
-        _ = NativeMethods.ShellNotifyIcon(NativeMethods.NimModify, ref notifyIconData);
+            if (!trayIconHost.UpdateIcon(iconHandle, BuildTrayToolTip(currentState)))
+            {
+                RuntimeLog.Write($"托盘更新失败，准备重建: state={FormatMasterVolumeStateForLog(currentState)}");
+                return;
+            }
+
+            if (!trayIconHost.IsCreated)
+                return;
+
+            lastTrayVolumeState = currentState;
+            if (!wasCreated)
+                RuntimeLog.Write($"托盘创建成功: state={FormatMasterVolumeStateForLog(currentState)}");
+        }
+        catch (Exception ex)
+        {
+            RuntimeLog.Write($"托盘更新异常: state={FormatMasterVolumeStateForLog(currentState)}, message={ex.Message}");
+            Trace.WriteLine($"[AudioRoute] 托盘图标更新失败: {ex}");
+        }
+    }
+
+    private static string FormatMasterVolumeStateForLog(MasterVolumeState? state)
+    {
+        if (state is not MasterVolumeState value)
+            return "null";
+
+        return $"{value.Percentage}%/{value.IconKind}/muted={value.IsMuted}";
     }
 
     private static string BuildTrayToolTip(MasterVolumeState? volumeState)
     {
         if (volumeState is null)
-            return "AudioRoute";
+            return "AudioRoute 未检测到默认输出设备";
 
         return volumeState.Value.IsMuted
             ? $"AudioRoute 主音量 {volumeState.Value.Percentage}% 已静音"
@@ -1385,24 +1485,6 @@ public sealed partial class MainWindow : Window
 
     private IntPtr WindowProc(IntPtr windowHandle, uint message, IntPtr wParam, IntPtr lParam)
     {
-        if (message == NativeMethods.WmTaskbarCreated)
-        {
-            if (!isExitRequested)
-            {
-                isTrayIconCreated = false;
-                lastTrayVolumeState = null;
-                InitializeTrayIcon();
-            }
-
-            return IntPtr.Zero;
-        }
-
-        if (message == TrayCallbackMessage)
-        {
-            HandleTrayMessage(NativeMethods.GetLowWord(lParam), wParam);
-            return IntPtr.Zero;
-        }
-
         if (message == NativeMethods.WmActivate &&
             NativeMethods.GetLowWord(wParam) == NativeMethods.WaInactive)
         {
@@ -1435,11 +1517,41 @@ public sealed partial class MainWindow : Window
                 ToggleStartupRegistration();
                 return IntPtr.Zero;
             }
+
+            if (commandId == ViewLogTrayMenuItemId)
+            {
+                OpenRuntimeLog();
+                return IntPtr.Zero;
+            }
         }
 
         return originalWindowProc != IntPtr.Zero
             ? NativeMethods.CallWindowProc(originalWindowProc, windowHandle, message, wParam, lParam)
             : NativeMethods.DefWindowProc(windowHandle, message, wParam, lParam);
+    }
+
+    private void OnTrayIconTaskbarCreated(object? sender, EventArgs e)
+    {
+        if (isExitRequested)
+            return;
+
+        lastTrayVolumeState = null;
+        TrayVolumeIconService.Invalidate();
+        InitializeTrayIcon();
+    }
+
+    private void OnTrayIconEnvironmentChanged(object? sender, EventArgs e)
+    {
+        if (isExitRequested)
+            return;
+
+        TrayVolumeIconService.Invalidate();
+        UpdateTrayIcon(force: true);
+    }
+
+    private void OnTrayIconMessageReceived(object? sender, ShellNotifyIconMessageEventArgs e)
+    {
+        HandleTrayMessage(e.TrayMessage, e.InvokePointData);
     }
 
     private void HandleTrayMessage(uint trayMessage, IntPtr invokePointData)
@@ -1475,7 +1587,7 @@ public sealed partial class MainWindow : Window
         if (callbackPoint.X != 0 || callbackPoint.Y != 0)
             return callbackPoint;
 
-        if (TryGetTrayIconRect(out var trayIconRect))
+        if (trayIconHost.TryGetIconRect(out var trayIconRect))
         {
             return new Point
             {
@@ -1487,18 +1599,6 @@ public sealed partial class MainWindow : Window
         return NativeMethods.GetCursorPos(out var cursorPosition)
             ? cursorPosition
             : default;
-    }
-
-    private bool TryGetTrayIconRect(out Rect trayIconRect)
-    {
-        var identifier = new NativeMethods.NotifyIconIdentifier
-        {
-            cbSize = (uint)Marshal.SizeOf<NativeMethods.NotifyIconIdentifier>(),
-            hWnd = hwnd,
-            uID = TrayIconId
-        };
-
-        return NativeMethods.ShellNotifyIconGetRect(ref identifier, out trayIconRect) == 0;
     }
 
     private void ShowTrayContextMenu(Point anchorPoint)
@@ -1521,6 +1621,7 @@ public sealed partial class MainWindow : Window
                 NativeMethods.MfString | (StartupManager.IsEnabled() ? NativeMethods.MfChecked : 0),
                 StartupTrayMenuItemId,
                 "开机自启");
+            _ = NativeMethods.AppendMenu(menuHandle, NativeMethods.MfString, ViewLogTrayMenuItemId, "查看日志");
             _ = NativeMethods.AppendMenu(menuHandle, NativeMethods.MfSeparator, 0, string.Empty);
             _ = NativeMethods.AppendMenu(menuHandle, NativeMethods.MfString, ExitTrayMenuItemId, "退出");
 
@@ -1535,7 +1636,7 @@ public sealed partial class MainWindow : Window
                 IntPtr.Zero);
 
             _ = NativeMethods.PostMessage(hwnd, NativeMethods.WmNull, IntPtr.Zero, IntPtr.Zero);
-            RestoreTrayIconFocus();
+            trayIconHost.SetFocus();
         }
         finally
         {
@@ -1554,6 +1655,14 @@ public sealed partial class MainWindow : Window
         {
             ShowError($"切换开机自启失败: {ex.Message}");
         }
+    }
+
+    private void OpenRuntimeLog()
+    {
+        if (RuntimeLog.TryOpenCurrentLog(out var errorMessage))
+            return;
+
+        ShowError($"打开日志失败: {errorMessage}");
     }
 
     private void RequestExit()
@@ -1591,7 +1700,7 @@ public sealed partial class MainWindow : Window
     {
         panelPosition = default;
 
-        if (!TryGetTrayIconRect(out var trayIconRect))
+        if (!trayIconHost.TryGetIconRect(out var trayIconRect))
             return false;
 
         var trayCenter = new PointInt32(
@@ -1605,22 +1714,7 @@ public sealed partial class MainWindow : Window
         return true;
     }
 
-    private void RestoreTrayIconFocus()
-    {
-        if (!isTrayIconCreated)
-            return;
-
-        var notifyIconData = new NativeMethods.NotifyIconData
-        {
-            cbSize = (uint)Marshal.SizeOf<NativeMethods.NotifyIconData>(),
-            hWnd = hwnd,
-            uID = TrayIconId
-        };
-
-        _ = NativeMethods.ShellNotifyIcon(NativeMethods.NimSetFocus, ref notifyIconData);
-    }
-
-    private static PointInt32 CalculatePanelPosition(RectInt32 workArea, Rect trayIconRect)
+    private static PointInt32 CalculatePanelPosition(RectInt32 workArea, ShellNotifyIconRect trayIconRect)
     {
         var minX = workArea.X + ScreenMargin;
         var minY = workArea.Y + ScreenMargin;
@@ -1636,7 +1730,7 @@ public sealed partial class MainWindow : Window
         };
     }
 
-    private static TrayDockEdge DetectTrayDockEdge(RectInt32 workArea, Rect trayIconRect)
+    private static TrayDockEdge DetectTrayDockEdge(RectInt32 workArea, ShellNotifyIconRect trayIconRect)
     {
         var workAreaLeft = workArea.X;
         var workAreaTop = workArea.Y;
@@ -1807,23 +1901,12 @@ public sealed partial class MainWindow : Window
         public const uint WmRButtonUp = 0x0205;
         public const uint EventSystemForeground = 0x0003;
         public const uint NinSelect = 0x0400;
-        public const uint NimAdd = 0x00000000;
-        public const uint NimModify = 0x00000001;
-        public const uint NimDelete = 0x00000002;
-        public const uint NimSetFocus = 0x00000003;
-        public const uint NimSetVersion = 0x00000004;
-        public const uint NifMessage = 0x00000001;
-        public const uint NifIcon = 0x00000002;
-        public const uint NifTip = 0x00000004;
-        public const uint NifShowTip = 0x00000080;
-        public const uint NotifyIconVersion4 = 4;
         public const uint MfString = 0x00000000;
         public const uint MfChecked = 0x00000008;
         public const uint MfSeparator = 0x00000800;
         public const uint WineventOutofcontext = 0x0000;
         public const uint WineventSkipOwnProcess = 0x0002;
         public const int ObjIdWindow = 0;
-        public static readonly uint WmTaskbarCreated = RegisterWindowMessage("TaskbarCreated");
         private const uint SwpFrameChanged = 0x0020;
         private const uint SwpNomove = 0x0002;
         private const uint SwpNozorder = 0x0004;
@@ -1874,11 +1957,6 @@ public sealed partial class MainWindow : Window
         public static IntPtr SetWindowProc(IntPtr hwnd, IntPtr windowProc)
         {
             return SetWindowLongPtr(hwnd, GwlWndProc, windowProc);
-        }
-
-        public static bool ShellNotifyIcon(uint message, ref NotifyIconData notifyIconData)
-        {
-            return Shell_NotifyIcon(message, ref notifyIconData);
         }
 
         public static uint GetLowWord(IntPtr value)
@@ -1954,15 +2032,6 @@ public sealed partial class MainWindow : Window
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool UnhookWinEvent(IntPtr hWinEventHook);
 
-        [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern bool Shell_NotifyIcon(uint dwMessage, ref NotifyIconData lpData);
-
-        [DllImport("shell32.dll", EntryPoint = "Shell_NotifyIconGetRect", SetLastError = true)]
-        public static extern int ShellNotifyIconGetRect(ref NotifyIconIdentifier identifier, out Rect iconLocation);
-
-        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern uint RegisterWindowMessage(string lpString);
-
         [DllImport("user32.dll", SetLastError = true)]
         private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 
@@ -1970,44 +2039,6 @@ public sealed partial class MainWindow : Window
         {
             _ = GetWindowThreadProcessId(hWnd, out var processId);
             return processId;
-        }
-
-        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-        public struct NotifyIconData
-        {
-            public uint cbSize;
-            public IntPtr hWnd;
-            public uint uID;
-            public uint uFlags;
-            public uint uCallbackMessage;
-            public IntPtr hIcon;
-
-            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
-            public string szTip;
-
-            public uint dwState;
-            public uint dwStateMask;
-
-            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
-            public string szInfo;
-
-            public uint uVersionOrTimeout;
-
-            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
-            public string szInfoTitle;
-
-            public uint dwInfoFlags;
-            public Guid guidItem;
-            public IntPtr hBalloonIcon;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        public struct NotifyIconIdentifier
-        {
-            public uint cbSize;
-            public IntPtr hWnd;
-            public uint uID;
-            public Guid guidItem;
         }
     }
 
@@ -2017,16 +2048,6 @@ public sealed partial class MainWindow : Window
         public int X;
         public int Y;
     }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct Rect
-    {
-        public int Left;
-        public int Top;
-        public int Right;
-        public int Bottom;
-    }
-
     private enum TrayDockEdge
     {
         Bottom,

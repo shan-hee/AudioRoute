@@ -7,7 +7,9 @@ public readonly record struct MasterVolumeState(int Percentage, bool IsMuted, Tr
 
 public enum TrayVolumeIconKind
 {
+    NoDevice,
     Muted,
+    ZeroBars,
     Low,
     Medium,
     High
@@ -33,18 +35,20 @@ public static class MasterVolumeService
     public static MasterVolumeState CreateState(float volumeScalar, bool isMuted)
     {
         var percentage = Math.Clamp((int)Math.Round(volumeScalar * 100), 0, 100);
-        var effectiveMuted = isMuted || percentage == 0;
 
         return new MasterVolumeState(
             percentage,
-            effectiveMuted,
-            ResolveIconKind(percentage, effectiveMuted));
+            isMuted,
+            ResolveIconKind(percentage, isMuted));
     }
 
     private static TrayVolumeIconKind ResolveIconKind(int percentage, bool isMuted)
     {
-        if (isMuted || percentage == 0)
+        if (isMuted)
             return TrayVolumeIconKind.Muted;
+
+        if (percentage == 0)
+            return TrayVolumeIconKind.ZeroBars;
 
         if (percentage < 34)
             return TrayVolumeIconKind.Low;

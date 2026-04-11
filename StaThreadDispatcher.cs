@@ -45,6 +45,15 @@ internal sealed class StaThreadDispatcher : IDisposable
         return workItem.Task;
     }
 
+    public Task InvokeAsync(Action work)
+    {
+        return InvokeAsync(() =>
+        {
+            work();
+            return true;
+        });
+    }
+
     public T Invoke<T>(Func<T> work)
     {
         return InvokeAsync(work).GetAwaiter().GetResult();
