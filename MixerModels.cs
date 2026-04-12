@@ -2,7 +2,7 @@
 
 namespace AudioRoute;
 
-public sealed class MixerSessionInfo
+public sealed record MixerSessionInfo
 {
     public required string SessionKey { get; init; }
     public required string DisplayName { get; init; }
@@ -19,6 +19,31 @@ public sealed class MixerSessionInfo
     public bool IsSystemSession { get; init; }
     public bool IsRoutingSupported { get; init; } = true;
     public bool CanChangeDevice => ProcessId > 0 && IsRoutingSupported;
+
+    public bool Equals(MixerSessionInfo? other)
+    {
+        if (other is null) return false;
+        if (ReferenceEquals(this, other)) return true;
+        return string.Equals(SessionKey, other.SessionKey, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(DisplayName, other.DisplayName, StringComparison.Ordinal) &&
+            string.Equals(ActualDeviceSummary, other.ActualDeviceSummary, StringComparison.Ordinal) &&
+            string.Equals(BoundDeviceSummary, other.BoundDeviceSummary, StringComparison.Ordinal) &&
+            string.Equals(ProcessName, other.ProcessName, StringComparison.Ordinal) &&
+            string.Equals(ExecutablePath, other.ExecutablePath, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(BoundDeviceId, other.BoundDeviceId, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(RoutingUnavailableReason, other.RoutingUnavailableReason, StringComparison.Ordinal) &&
+            Flow == other.Flow &&
+            ProcessId == other.ProcessId &&
+            Math.Abs(Volume - other.Volume) < 0.001f &&
+            IsMuted == other.IsMuted &&
+            IsSystemSession == other.IsSystemSession &&
+            IsRoutingSupported == other.IsRoutingSupported;
+    }
+
+    public override int GetHashCode()
+    {
+        return StringComparer.OrdinalIgnoreCase.GetHashCode(SessionKey ?? string.Empty);
+    }
 }
 
 public sealed class MixerAppSessionInfo

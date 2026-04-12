@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Linq;
 
 namespace AudioRoute;
 
@@ -71,9 +70,21 @@ internal sealed class ExpiringCache<TKey, TValue> where TKey : notnull
     {
         lock (syncRoot)
         {
-            var keysToRemove = entries.Keys.Where(predicate).ToArray();
-            foreach (var key in keysToRemove)
-                entries.Remove(key);
+            List<TKey>? keysToRemove = null;
+            foreach (var key in entries.Keys)
+            {
+                if (predicate(key))
+                {
+                    keysToRemove ??= new List<TKey>();
+                    keysToRemove.Add(key);
+                }
+            }
+
+            if (keysToRemove is not null)
+            {
+                foreach (var key in keysToRemove)
+                    entries.Remove(key);
+            }
         }
     }
 
@@ -85,28 +96,57 @@ internal sealed class ExpiringCache<TKey, TValue> where TKey : notnull
 
     private void PruneCore(DateTimeOffset now)
     {
-        if (entries.Count == 0)
+        if (entries.Count <= capacity)
             return;
 
-        var expiredKeys = entries
-            .Where(pair => pair.Value.ExpiresAt <= now)
-            .Select(pair => pair.Key)
-            .ToArray();
+        List<TKey>? expiredKeys = null;
+        foreach (var pair in entries)
+        {
+            if (pair.Value.ExpiresAt <= now)
+            {
+                expiredKeys ??= new List<TKey>();
+                expiredKeys.Add(pair.Key);
+            }
+        }
 
-        foreach (var key in expiredKeys)
-            entries.Remove(key);
+        if (expiredKeys is not null)
+        {
+            foreach (var key in expiredKeys)
+                entries.Remove(key);
+        }
 
         if (entries.Count <= capacity)
             return;
 
-        var overflowKeys = entries
-            .OrderBy(pair => pair.Value.LastAccessStamp)
-            .Take(entries.Count - capacity)
-            .Select(pair => pair.Key)
-            .ToArray();
+        var removeCount = entries.Count - capacity;
+        var stamps = new long[entries.Count];
+        var index = 0;
+        foreach (var pair in entries)
+            stamps[index++] = pair.Value.LastAccessStamp;
 
-        foreach (var key in overflowKeys)
-            entries.Remove(key);
+        Array.Sort(stamps);
+        var threshold = stamps[removeCount - 1];
+
+        List<TKey>? overflowKeys = null;
+        var removed = 0;
+        foreach (var pair in entries)
+        {
+            if (removed >= removeCount)
+                break;
+
+            if (pair.Value.LastAccessStamp <= threshold)
+            {
+                overflowKeys ??= new List<TKey>();
+                overflowKeys.Add(pair.Key);
+                removed++;
+            }
+        }
+
+        if (overflowKeys is not null)
+        {
+            foreach (var key in overflowKeys)
+                entries.Remove(key);
+        }
     }
 
     private sealed class CacheEntry

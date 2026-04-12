@@ -283,7 +283,7 @@ public sealed partial class SessionCardControl : UserControl
 
     private void ApplyOptimisticRouteSelection(MixerSessionInfo session, EDataFlow flow, string? deviceId, string title)
     {
-        var updatedSession = CloneSession(session, useBoundDeviceId: true, boundDeviceId: deviceId, boundDeviceSummary: title);
+        var updatedSession = session with { BoundDeviceId = deviceId, BoundDeviceSummary = title };
         ReplaceSession(flow, updatedSession);
 
         ApplySession();
@@ -447,7 +447,7 @@ public sealed partial class SessionCardControl : UserControl
         if (session is null)
             return false;
 
-        ReplaceSession(flow, CloneSession(session, volume: volume, isMuted: muted));
+        ReplaceSession(flow, session with { Volume = volume, IsMuted = muted });
         return true;
     }
 
@@ -462,33 +462,6 @@ public sealed partial class SessionCardControl : UserControl
             PrimarySession = outputSession ?? inputSession ?? updatedSession,
             OutputSession = outputSession,
             InputSession = inputSession
-        };
-    }
-
-    private static MixerSessionInfo CloneSession(
-        MixerSessionInfo session,
-        bool useBoundDeviceId = false,
-        string? boundDeviceId = null,
-        string? boundDeviceSummary = null,
-        float? volume = null,
-        bool? isMuted = null)
-    {
-        return new MixerSessionInfo
-        {
-            SessionKey = session.SessionKey,
-            DisplayName = session.DisplayName,
-            ActualDeviceSummary = session.ActualDeviceSummary,
-            BoundDeviceSummary = boundDeviceSummary ?? session.BoundDeviceSummary,
-            ProcessName = session.ProcessName,
-            ExecutablePath = session.ExecutablePath,
-            BoundDeviceId = useBoundDeviceId ? boundDeviceId : session.BoundDeviceId,
-            RoutingUnavailableReason = session.RoutingUnavailableReason,
-            Flow = session.Flow,
-            ProcessId = session.ProcessId,
-            Volume = volume ?? session.Volume,
-            IsMuted = isMuted ?? session.IsMuted,
-            IsSystemSession = session.IsSystemSession,
-            IsRoutingSupported = session.IsRoutingSupported
         };
     }
 
