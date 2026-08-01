@@ -1,7 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 
 namespace AudioRoute;
 
@@ -78,23 +78,36 @@ public static class AudioPolicyManager
         return PolicyThread.Invoke(() => GetAppDefaultDeviceCore(cacheKey));
     }
 
-    public static void SetAppDefaultDevice(uint processId, string deviceId, EDataFlow flow = EDataFlow.eRender, ERole role = ERole.eMultimedia)
+    public static async Task SetAppDefaultDeviceAsync(
+        uint processId,
+        string deviceId,
+        EDataFlow flow = EDataFlow.eRender,
+        ERole role = ERole.eMultimedia)
     {
         EnsureFlowSupported(flow);
         if (string.IsNullOrWhiteSpace(deviceId))
             throw new ArgumentException("Device ID cannot be empty.", nameof(deviceId));
 
-        EnsureRoutingSupported();
-        PolicyThread.Invoke(() => SetAppDefaultDeviceCore(processId, deviceId, flow, role));
+        await PolicyThread.InvokeAsync(() =>
+        {
+            EnsureRoutingSupported();
+            SetAppDefaultDeviceCore(processId, deviceId, flow, role);
+        });
 
         InvalidateDefaultDeviceCache(processId, flow);
     }
 
-    public static void ClearAppDefaultDevice(uint processId, EDataFlow flow = EDataFlow.eRender, ERole role = ERole.eMultimedia)
+    public static async Task ClearAppDefaultDeviceAsync(
+        uint processId,
+        EDataFlow flow = EDataFlow.eRender,
+        ERole role = ERole.eMultimedia)
     {
         EnsureFlowSupported(flow);
-        EnsureRoutingSupported();
-        PolicyThread.Invoke(() => ClearAppDefaultDeviceCore(processId, flow, role));
+        await PolicyThread.InvokeAsync(() =>
+        {
+            EnsureRoutingSupported();
+            ClearAppDefaultDeviceCore(processId, flow, role);
+        });
 
         InvalidateDefaultDeviceCache(processId, flow);
     }
@@ -181,7 +194,7 @@ public static class AudioPolicyManager
         }
         catch (Exception ex)
         {
-            Trace.WriteLine($"[AudioRoute] 读取应用级音频路由失败: {ex}");
+            RuntimeLog.WriteException("读取应用级音频路由失败", ex);
             DefaultDeviceCache.Set(cacheKey, null);
             return null;
         }
@@ -203,7 +216,7 @@ public static class AudioPolicyManager
         }
         catch (Exception ex)
         {
-            Trace.WriteLine($"[AudioRoute] 设置应用级音频路由失败: {ex}");
+            RuntimeLog.WriteException("设置应用级音频路由失败", ex);
             throw;
         }
     }
@@ -220,7 +233,7 @@ public static class AudioPolicyManager
         }
         catch (Exception ex)
         {
-            Trace.WriteLine($"[AudioRoute] 清除应用级音频路由失败: {ex}");
+            RuntimeLog.WriteException("清除应用级音频路由失败", ex);
             throw;
         }
     }
@@ -238,7 +251,7 @@ public static class AudioPolicyManager
             EnsureFactory();
             s_supportState = AudioRoutingSupportState.Supported;
             s_supportFailureReason = null;
-            Trace.WriteLine("[AudioRoute] 应用级音频路由已启用。");
+            RuntimeLog.Write("应用级音频路由已启用");
             return true;
         }
         catch (Exception ex)
@@ -447,7 +460,7 @@ public static class AudioPolicyManager
     private static void MarkUnsupported(Exception ex, string message)
     {
         if (s_supportState != AudioRoutingSupportState.Unsupported)
-            Trace.WriteLine($"[AudioRoute] {message} {ex.Message}");
+            RuntimeLog.WriteException(message, ex);
 
         s_supportState = AudioRoutingSupportState.Unsupported;
         s_supportFailureReason = $"{DefaultUnsupportedReason} {ex.Message}";

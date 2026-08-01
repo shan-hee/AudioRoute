@@ -76,8 +76,12 @@ internal sealed class StaThreadDispatcher : IDisposable
         disposed = true;
         workItems.CompleteAdding();
 
-        if (Environment.CurrentManagedThreadId != managedThreadId && thread.IsAlive)
-            thread.Join(TimeSpan.FromSeconds(2));
+        if (Environment.CurrentManagedThreadId != managedThreadId &&
+            thread.IsAlive &&
+            !thread.Join(TimeSpan.FromSeconds(2)))
+        {
+            RuntimeLog.Write($"后台线程未在清理时限内退出: name={thread.Name}, managedThreadId={managedThreadId}");
+        }
     }
 
     private void Run()

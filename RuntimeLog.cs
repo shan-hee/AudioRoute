@@ -8,34 +8,35 @@ namespace AudioRoute;
 
 internal static class RuntimeLog
 {
-    private const int ArchivedLogRetentionCount = 5;
+    private const int ArchivedLogRetentionCount = 10;
+    private const long MaxCurrentLogLength = 5 * 1024 * 1024;
+    private const string ArchivedLogSearchPattern = "AudioRoute-*.log";
     private static readonly object SyncRoot = new();
-    private static readonly string LogPath = Path.Combine(Path.GetTempPath(), "AudioRoute.log");
-    private static readonly string ArchivedLogSearchPattern = "AudioRoute-*.log";
+    private static readonly string LogDirectory = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "AudioRoute",
+        "Logs");
+    private static readonly string LogPath = Path.Combine(LogDirectory, "AudioRoute.log");
 
     public static string PathOnDisk => LogPath;
 
-    public static void Reset()
+    public static void BeginSession()
     {
         try
         {
             lock (SyncRoot)
             {
-                if (File.Exists(LogPath))
-                {
-                    var logFile = new FileInfo(LogPath);
-                    if (logFile.Length > 0)
-                        File.Move(LogPath, CreateArchivePathCore());
-                    else
-                        File.Delete(LogPath);
-                }
-
+                Directory.CreateDirectory(LogDirectory);
+                RotateOversizedLogCore();
                 DeleteExpiredArchivesCore();
+                DeleteLegacyTempLogsCore();
             }
         }
         catch
         {
         }
+
+        Write("========== 新运行会话 ==========");
     }
 
     public static void Write(string message)
@@ -45,6 +46,7 @@ internal static class RuntimeLog
             var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [T{Environment.CurrentManagedThreadId}] {message}";
             lock (SyncRoot)
             {
+                Directory.CreateDirectory(LogDirectory);
                 File.AppendAllText(LogPath, line + Environment.NewLine, Encoding.UTF8);
             }
         }
@@ -53,12 +55,18 @@ internal static class RuntimeLog
         }
     }
 
+    public static void WriteException(string operation, Exception exception)
+    {
+        Write($"{operation}: {exception}");
+    }
+
     public static bool TryOpenCurrentLog(out string? errorMessage)
     {
         try
         {
             lock (SyncRoot)
             {
+                Directory.CreateDirectory(LogDirectory);
                 EnsureCurrentLogExistsCore();
             }
 
@@ -86,16 +94,27 @@ internal static class RuntimeLog
         File.WriteAllText(LogPath, string.Empty, Encoding.UTF8);
     }
 
+    private static void RotateOversizedLogCore()
+    {
+        if (!File.Exists(LogPath))
+            return;
+
+        var logFile = new FileInfo(LogPath);
+        if (logFile.Length < MaxCurrentLogLength)
+            return;
+
+        File.Move(LogPath, CreateArchivePathCore());
+    }
+
     private static string CreateArchivePathCore()
     {
-        var directory = Path.GetDirectoryName(LogPath) ?? Path.GetTempPath();
         var timestamp = DateTime.Now.ToString("yyyyMMdd-HHmmss-fff");
-        var candidatePath = Path.Combine(directory, $"AudioRoute-{timestamp}.log");
+        var candidatePath = Path.Combine(LogDirectory, $"AudioRoute-{timestamp}.log");
         var suffix = 1;
 
         while (File.Exists(candidatePath))
         {
-            candidatePath = Path.Combine(directory, $"AudioRoute-{timestamp}-{suffix}.log");
+            candidatePath = Path.Combine(LogDirectory, $"AudioRoute-{timestamp}-{suffix}.log");
             suffix++;
         }
 
@@ -104,8 +123,7 @@ internal static class RuntimeLog
 
     private static void DeleteExpiredArchivesCore()
     {
-        var directory = Path.GetDirectoryName(LogPath) ?? Path.GetTempPath();
-        var archivedLogs = new DirectoryInfo(directory)
+        var archivedLogs = new DirectoryInfo(LogDirectory)
             .GetFiles(ArchivedLogSearchPattern)
             .OrderByDescending(file => file.LastWriteTimeUtc)
             .Skip(ArchivedLogRetentionCount);
@@ -115,6 +133,21 @@ internal static class RuntimeLog
             try
             {
                 archivedLog.Delete();
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    private static void DeleteLegacyTempLogsCore()
+    {
+        var tempDirectory = new DirectoryInfo(Path.GetTempPath());
+        foreach (var legacyLog in tempDirectory.GetFiles("AudioRoute*.log"))
+        {
+            try
+            {
+                legacyLog.Delete();
             }
             catch
             {

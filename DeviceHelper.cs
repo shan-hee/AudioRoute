@@ -1,6 +1,5 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 namespace AudioRoute;
@@ -250,7 +249,7 @@ public static class DeviceEnumerator
         }
         catch (Exception ex)
         {
-            Trace.WriteLine($"[AudioRoute] 枚举音频设备失败: {ex}");
+            RuntimeLog.WriteException("枚举音频设备失败", ex);
             throw;
         }
         finally

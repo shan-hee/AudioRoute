@@ -1,5 +1,4 @@
 using System;
-using System.Diagnostics;
 using System.Numerics;
 using System.Threading.Tasks;
 using Microsoft.UI.Composition;
@@ -129,7 +128,7 @@ internal sealed class PanelController : IDisposable
             NativeMethods.WineventOutofcontext | NativeMethods.WineventSkipOwnProcess);
 
         if (foregroundEventHook == IntPtr.Zero)
-            Trace.WriteLine("[AudioRoute] Failed to attach foreground event hook, fallback timer will be used.");
+            RuntimeLog.Write("附加前台窗口事件 Hook 失败，启用轮询回退");
     }
 
     public void DetachForegroundEventHook()

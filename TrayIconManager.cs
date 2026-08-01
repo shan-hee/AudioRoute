@@ -1,12 +1,13 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Threading.Tasks;
+using Microsoft.UI.Dispatching;
 
 namespace AudioRoute;
 
 internal sealed class TrayIconManager : IDisposable
 {
+    private const int MaxTrayRetryAttempts = 3;
     private const uint HomeTrayMenuItemId = 1001;
     private const uint ExitTrayMenuItemId = 1002;
     private const uint StartupTrayMenuItemId = 1003;
@@ -14,15 +15,24 @@ internal sealed class TrayIconManager : IDisposable
 
     private readonly Func<IntPtr> getWindowHandle;
     private readonly ShellNotifyIconHost trayIconHost;
+    private readonly DispatcherQueueTimer trayRetryTimer;
     private MasterVolumeState? lastTrayVolumeState;
+    private MasterVolumeState? pendingTrayRetryState;
     private DateTimeOffset lastPrimaryTrayInvokeAt;
     private DateTimeOffset suppressPrimaryTrayInvokeUntil;
     private bool disposed;
+    private int trayRetryAttempt;
 
-    public TrayIconManager(Func<IntPtr> getWindowHandle, ShellNotifyIconHost trayIconHost)
+    public TrayIconManager(
+        Func<IntPtr> getWindowHandle,
+        ShellNotifyIconHost trayIconHost,
+        DispatcherQueue dispatcherQueue)
     {
         this.getWindowHandle = getWindowHandle;
         this.trayIconHost = trayIconHost;
+        trayRetryTimer = dispatcherQueue.CreateTimer();
+        trayRetryTimer.IsRepeating = false;
+        trayRetryTimer.Tick += OnTrayRetryTimerTick;
         trayIconHost.MessageReceived += OnTrayIconMessageReceived;
         trayIconHost.TaskbarCreated += OnTrayIconTaskbarCreated;
         trayIconHost.EnvironmentChanged += OnTrayIconEnvironmentChanged;
@@ -121,6 +131,7 @@ internal sealed class TrayIconManager : IDisposable
         if (disposed)
             return;
 
+        CancelTrayIconRetry();
         lastTrayVolumeState = null;
         TrayVolumeIconService.Invalidate();
         Initialize();
@@ -131,6 +142,7 @@ internal sealed class TrayIconManager : IDisposable
         if (disposed)
             return;
 
+        CancelTrayIconRetry();
         TrayVolumeIconService.Invalidate();
         UpdateTrayIcon(force: true);
     }
@@ -141,6 +153,8 @@ internal sealed class TrayIconManager : IDisposable
             return;
 
         disposed = true;
+        CancelTrayIconRetry();
+        trayRetryTimer.Tick -= OnTrayRetryTimerTick;
         trayIconHost.MessageReceived -= OnTrayIconMessageReceived;
         trayIconHost.TaskbarCreated -= OnTrayIconTaskbarCreated;
         trayIconHost.EnvironmentChanged -= OnTrayIconEnvironmentChanged;
@@ -173,22 +187,70 @@ internal sealed class TrayIconManager : IDisposable
 
             if (!trayIconHost.UpdateIcon(iconHandle, BuildTrayToolTip(currentState)))
             {
-                RuntimeLog.Write($"托盘更新失败，准备重建: state={FormatMasterVolumeStateForLog(currentState)}");
+                ScheduleTrayIconRetry(currentState);
                 return;
             }
 
             if (!trayIconHost.IsCreated)
                 return;
 
+            CancelTrayIconRetry();
             lastTrayVolumeState = currentState;
             if (!wasCreated)
                 RuntimeLog.Write($"托盘创建成功: state={FormatMasterVolumeStateForLog(currentState)}");
         }
         catch (Exception ex)
         {
-            RuntimeLog.Write($"托盘更新异常: state={FormatMasterVolumeStateForLog(currentState)}, message={ex.Message}");
-            Trace.WriteLine($"[AudioRoute] 托盘图标更新失败: {ex}");
+            RuntimeLog.WriteException(
+                $"托盘图标更新异常: state={FormatMasterVolumeStateForLog(currentState)}",
+                ex);
+            ScheduleTrayIconRetry(currentState);
         }
+    }
+
+    private void ScheduleTrayIconRetry(MasterVolumeState? currentState)
+    {
+        if (disposed)
+            return;
+
+        pendingTrayRetryState = currentState;
+        if (trayRetryAttempt >= MaxTrayRetryAttempts)
+        {
+            RuntimeLog.Write(
+                $"托盘重建重试已耗尽: attempts={trayRetryAttempt}, " +
+                $"state={FormatMasterVolumeStateForLog(currentState)}");
+            return;
+        }
+
+        trayRetryAttempt++;
+        trayRetryTimer.Stop();
+        trayRetryTimer.Interval = trayRetryAttempt switch
+        {
+            1 => TimeSpan.FromMilliseconds(250),
+            2 => TimeSpan.FromSeconds(1),
+            _ => TimeSpan.FromSeconds(3)
+        };
+        trayRetryTimer.Start();
+        RuntimeLog.Write(
+            $"托盘更新失败，已安排重建: attempt={trayRetryAttempt}/{MaxTrayRetryAttempts}, " +
+            $"delay={trayRetryTimer.Interval.TotalMilliseconds:F0}ms, " +
+            $"state={FormatMasterVolumeStateForLog(currentState)}");
+    }
+
+    private void CancelTrayIconRetry()
+    {
+        trayRetryTimer.Stop();
+        pendingTrayRetryState = null;
+        trayRetryAttempt = 0;
+    }
+
+    private void OnTrayRetryTimerTick(DispatcherQueueTimer sender, object args)
+    {
+        sender.Stop();
+        if (disposed)
+            return;
+
+        ApplyTrayIconUpdate(pendingTrayRetryState, force: true);
     }
 
     private static string BuildTrayToolTip(MasterVolumeState? volumeState)

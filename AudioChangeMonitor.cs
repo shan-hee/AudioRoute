@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using NAudio.CoreAudioApi;
 using NAudio.CoreAudioApi.Interfaces;
 using NAudioAudioSessionState = NAudio.CoreAudioApi.Interfaces.AudioSessionState;
@@ -68,18 +70,35 @@ internal sealed class ObservedSessionStructureChangedEventArgs : EventArgs
 
 internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
 {
-    private readonly object rebuildSync = new();
-    private readonly object syncRoot = new();
-    private readonly MMDeviceEnumerator deviceEnumerator = new();
+    private const int TopologyRebuildDebounceMilliseconds = 250;
+    private readonly StaThreadDispatcher monitorDispatcher;
+    private readonly Timer topologyRebuildTimer;
     private readonly List<DeviceRegistration> deviceRegistrations = new();
     private readonly Dictionary<string, SessionRegistration> sessionRegistrations = new(StringComparer.OrdinalIgnoreCase);
     private DefaultRenderEndpointRegistration? defaultRenderEndpointRegistration;
-    private bool disposed;
+    private MMDeviceEnumerator? deviceEnumerator;
+    private volatile bool disposed;
+    private int topologyRebuildPending;
+    private int topologyWorkQueued;
 
     public AudioChangeMonitor()
     {
-        deviceEnumerator.RegisterEndpointNotificationCallback(this);
-        RebuildSubscriptions();
+        monitorDispatcher = new StaThreadDispatcher("AudioRoute.Monitor");
+        topologyRebuildTimer = new Timer(
+            _ => QueuePendingTopologyRebuild(),
+            null,
+            Timeout.Infinite,
+            Timeout.Infinite);
+        var initialization = monitorDispatcher.InvokeAsync(InitializeMonitorCore);
+        _ = initialization.ContinueWith(
+            completedWork =>
+            {
+                if (completedWork.Exception is not null)
+                    RuntimeLog.WriteException("初始化音频监听器失败", completedWork.Exception.GetBaseException());
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     public event EventHandler? Changed;
@@ -97,12 +116,17 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         if (disposed)
             return false;
 
-        if (TrySetSessionVolumeCore(sessionKey, flow, volume))
-            return true;
+        return monitorDispatcher.Invoke(() =>
+        {
+            if (disposed)
+                return false;
 
-        RebuildSubscriptions();
+            if (TrySetSessionVolumeCore(sessionKey, flow, volume))
+                return true;
 
-        return TrySetSessionVolumeCore(sessionKey, flow, volume);
+            RebuildSubscriptions();
+            return TrySetSessionVolumeCore(sessionKey, flow, volume);
+        });
     }
 
     private bool TrySetSessionVolumeCore(string sessionKey, EDataFlow flow, float volume)
@@ -110,19 +134,16 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         List<SessionRegistration>? matchingRegistrations = null;
         var clampedVolume = Math.Clamp(volume, 0f, 1f);
 
-        lock (syncRoot)
+        foreach (var registration in sessionRegistrations.Values)
         {
-            foreach (var registration in sessionRegistrations.Values)
+            if (registration.Flow != flow ||
+                !string.Equals(registration.SessionKey, sessionKey, StringComparison.OrdinalIgnoreCase))
             {
-                if (registration.Flow != flow ||
-                    !string.Equals(registration.SessionKey, sessionKey, StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-
-                matchingRegistrations ??= new List<SessionRegistration>();
-                matchingRegistrations.Add(registration);
+                continue;
             }
+
+            matchingRegistrations ??= new List<SessionRegistration>();
+            matchingRegistrations.Add(registration);
         }
 
         if (matchingRegistrations is null || matchingRegistrations.Count == 0)
@@ -146,7 +167,7 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
             }
             catch (Exception ex)
             {
-                Trace.WriteLine($"[AudioRoute] Failed to set tracked session volume: key={sessionKey}, flow={flow}, {ex}");
+                RuntimeLog.WriteException($"设置已监听会话音量失败: key={sessionKey}, flow={flow}", ex);
             }
         }
 
@@ -159,63 +180,107 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
             return;
 
         disposed = true;
+        topologyRebuildTimer.Dispose();
 
         try
         {
-            deviceEnumerator.UnregisterEndpointNotificationCallback(this);
+            var cleanup = monitorDispatcher.InvokeAsync(DisposeMonitorCore);
+            _ = cleanup.ContinueWith(
+                completedWork =>
+                {
+                    if (completedWork.Exception is not null)
+                        RuntimeLog.WriteException("释放音频监听线程资源失败", completedWork.Exception.GetBaseException());
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
         }
         catch (Exception ex)
         {
-            Trace.WriteLine($"[AudioRoute] Failed to unregister endpoint notifications: {ex}");
+            RuntimeLog.WriteException("投递音频监听线程清理任务失败", ex);
+        }
+        finally
+        {
+            monitorDispatcher.Dispose();
+        }
+    }
+
+    private void DisposeMonitorCore()
+    {
+        var enumerator = deviceEnumerator;
+        deviceEnumerator = null;
+        if (enumerator is null)
+            return;
+
+        try
+        {
+            enumerator.UnregisterEndpointNotificationCallback(this);
+        }
+        catch (Exception ex)
+        {
+            RuntimeLog.WriteException("注销设备端点通知失败", ex);
         }
 
         DefaultRenderEndpointRegistration? previousDefaultRegistration;
         List<SessionRegistration> previousSessionRegistrations;
         List<DeviceRegistration> previousDeviceRegistrations;
-        lock (syncRoot)
-        {
-            DetachRegistrationsCore(
-                out previousDefaultRegistration,
-                out previousSessionRegistrations,
-                out previousDeviceRegistrations);
-        }
+        DetachRegistrationsCore(
+            out previousDefaultRegistration,
+            out previousSessionRegistrations,
+            out previousDeviceRegistrations);
 
         DisposeRegistrations(previousDefaultRegistration, previousSessionRegistrations, previousDeviceRegistrations);
 
-        deviceEnumerator.Dispose();
+        enumerator.Dispose();
+    }
+
+    private void InitializeMonitorCore()
+    {
+        if (disposed)
+            return;
+
+        var enumerator = new MMDeviceEnumerator();
+        try
+        {
+            enumerator.RegisterEndpointNotificationCallback(this);
+            deviceEnumerator = enumerator;
+            RebuildSubscriptions();
+        }
+        catch
+        {
+            deviceEnumerator = enumerator;
+            DisposeMonitorCore();
+            throw;
+        }
     }
 
     void IMMNotificationClient.OnDefaultDeviceChanged(NAudioDataFlow flow, Role role, string defaultDeviceId)
     {
-        Trace.WriteLine($"[AudioRoute] Default device changed: flow={flow}, role={role}, id={defaultDeviceId}");
         RuntimeLog.Write($"默认设备变化: flow={flow}, role={role}, id={defaultDeviceId}");
         HandleDeviceTopologyChanged();
     }
 
     void IMMNotificationClient.OnDeviceAdded(string pwstrDeviceId)
     {
-        Trace.WriteLine($"[AudioRoute] Device added: id={pwstrDeviceId}");
         RuntimeLog.Write($"设备新增: id={pwstrDeviceId}");
         HandleDeviceTopologyChanged();
     }
 
     void IMMNotificationClient.OnDeviceRemoved(string deviceId)
     {
-        Trace.WriteLine($"[AudioRoute] Device removed: id={deviceId}");
         RuntimeLog.Write($"设备移除: id={deviceId}");
         HandleDeviceTopologyChanged();
     }
 
     void IMMNotificationClient.OnDeviceStateChanged(string deviceId, NAudioDeviceState newState)
     {
-        Trace.WriteLine($"[AudioRoute] Device state changed: id={deviceId}, state={newState}");
         RuntimeLog.Write($"设备状态变化: id={deviceId}, state={newState}");
         HandleDeviceTopologyChanged();
     }
 
     void IMMNotificationClient.OnPropertyValueChanged(string pwstrDeviceId, NAudioPropertyKey key)
     {
-        Trace.WriteLine($"[AudioRoute] Device property changed: id={pwstrDeviceId}");
+        RuntimeLog.Write($"设备属性变化: id={pwstrDeviceId}, key={key}");
     }
 
     private void HandleDeviceTopologyChanged()
@@ -223,41 +288,90 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         if (disposed)
             return;
 
-        RuntimeLog.Write("监听器拓扑变化: begin");
+        RuntimeLog.Write("监听器拓扑变化: queued");
         DeviceEnumerator.InvalidateCache();
+        Interlocked.Exchange(ref topologyRebuildPending, 1);
+        ScheduleTopologyRebuild();
+    }
+
+    private void ScheduleTopologyRebuild()
+    {
+        if (disposed)
+            return;
+
+        try
+        {
+            topologyRebuildTimer.Change(TopologyRebuildDebounceMilliseconds, Timeout.Infinite);
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+    }
+
+    private void QueuePendingTopologyRebuild()
+    {
+        if (disposed || Interlocked.Exchange(ref topologyWorkQueued, 1) != 0)
+            return;
+
+        try
+        {
+            var work = monitorDispatcher.InvokeAsync(ProcessPendingTopologyRebuild);
+            _ = work.ContinueWith(
+                completedWork =>
+                {
+                    Interlocked.Exchange(ref topologyWorkQueued, 0);
+
+                    if (completedWork.Exception is not null)
+                        RuntimeLog.WriteException("音频监听器后台重建失败", completedWork.Exception.GetBaseException());
+
+                    if (!disposed && Volatile.Read(ref topologyRebuildPending) != 0)
+                        ScheduleTopologyRebuild();
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Exchange(ref topologyWorkQueued, 0);
+            RuntimeLog.WriteException("投递音频监听器重建任务失败", ex);
+        }
+    }
+
+    private void ProcessPendingTopologyRebuild()
+    {
+        if (disposed || Interlocked.Exchange(ref topologyRebuildPending, 0) == 0)
+            return;
+
+        var startedAt = Stopwatch.GetTimestamp();
+        RuntimeLog.Write("监听器拓扑变化: begin");
         RebuildSubscriptions();
         RaiseChanged();
-        RuntimeLog.Write("监听器拓扑变化: done");
+        RuntimeLog.Write($"监听器拓扑变化: done, elapsed={Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds:F0}ms");
     }
 
     private void RebuildSubscriptions()
     {
-        lock (rebuildSync)
-        {
-            if (disposed)
-                return;
+        if (disposed || deviceEnumerator is null)
+            return;
 
-            DefaultRenderEndpointRegistration? previousDefaultRegistration;
-            List<SessionRegistration> previousSessionRegistrations;
-            List<DeviceRegistration> previousDeviceRegistrations;
+        DefaultRenderEndpointRegistration? previousDefaultRegistration;
+        List<SessionRegistration> previousSessionRegistrations;
+        List<DeviceRegistration> previousDeviceRegistrations;
 
-            lock (syncRoot)
-            {
-                DetachRegistrationsCore(
-                    out previousDefaultRegistration,
-                    out previousSessionRegistrations,
-                    out previousDeviceRegistrations);
-            }
+        DetachRegistrationsCore(
+            out previousDefaultRegistration,
+            out previousSessionRegistrations,
+            out previousDeviceRegistrations);
 
-            DisposeRegistrations(previousDefaultRegistration, previousSessionRegistrations, previousDeviceRegistrations);
+        DisposeRegistrations(previousDefaultRegistration, previousSessionRegistrations, previousDeviceRegistrations);
 
-            if (disposed)
-                return;
+        if (disposed)
+            return;
 
-            RuntimeLog.Write("监听器重建订阅: rebuilding");
-            RebuildSubscriptionsCore();
-            RuntimeLog.Write("监听器重建订阅: rebuilt");
-        }
+        RuntimeLog.Write("监听器重建订阅: rebuilding");
+        RebuildSubscriptionsCore();
+        RuntimeLog.Write("监听器重建订阅: rebuilt");
     }
 
     private void RebuildSubscriptionsCore()
@@ -273,7 +387,7 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
 
         try
         {
-            var device = deviceEnumerator.GetDefaultAudioEndpoint(NAudioDataFlow.Render, Role.Multimedia);
+            var device = deviceEnumerator!.GetDefaultAudioEndpoint(NAudioDataFlow.Render, Role.Multimedia);
             var endpointVolume = device.AudioEndpointVolume;
             AudioEndpointVolumeNotificationDelegate notificationHandler = notification =>
                 HandleMasterVolumeNotification(notification.MasterVolume, notification.Muted);
@@ -283,20 +397,17 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         }
         catch (Exception ex)
         {
-            Trace.WriteLine($"[AudioRoute] Failed to register default render endpoint volume watcher: {ex}");
+            RuntimeLog.WriteException("注册默认输出设备音量监听器失败", ex);
         }
 
-        lock (syncRoot)
+        if (disposed)
         {
-            if (disposed)
-            {
-                nextRegistration?.Dispose();
-                return;
-            }
-
-            defaultRenderEndpointRegistration = nextRegistration;
-            nextRegistration = null;
+            nextRegistration?.Dispose();
+            return;
         }
+
+        defaultRenderEndpointRegistration = nextRegistration;
+        nextRegistration = null;
 
         nextRegistration?.Dispose();
 
@@ -310,7 +421,7 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
 
         try
         {
-            devices = deviceEnumerator.EnumerateAudioEndPoints(flow, NAudioDeviceState.Active);
+            devices = deviceEnumerator!.EnumerateAudioEndPoints(flow, NAudioDeviceState.Active);
             for (var index = 0; index < devices.Count; index++)
             {
                 MMDevice? device = null;
@@ -323,28 +434,20 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
                     sessionManager = device.AudioSessionManager;
 
                     AudioSessionManager.SessionCreatedDelegate sessionCreatedHandler =
-                        (sender, newSessionControl) => HandleSessionCreated(appFlow, sender, newSessionControl);
+                        (_, newSessionControl) => QueueSessionCreated(appFlow, newSessionControl);
                     var deviceRegistration = new DeviceRegistration(device, sessionManager, sessionCreatedHandler);
                     sessionManager.OnSessionCreated += deviceRegistration.SessionCreatedHandler;
                     sessionManager.RefreshSessions();
 
-                    var keepDeviceRegistration = false;
-                    lock (syncRoot)
-                    {
-                        if (!disposed)
-                        {
-                            deviceRegistrations.Add(deviceRegistration);
-                            keepDeviceRegistration = true;
-                        }
-                    }
-
-                    if (!keepDeviceRegistration)
+                    if (disposed)
                     {
                         deviceRegistration.Dispose();
                         device = null;
                         sessionManager = null;
                         continue;
                     }
+
+                    deviceRegistrations.Add(deviceRegistration);
 
                     device = null;
                     sessionManager = null;
@@ -368,7 +471,7 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
                 }
                 catch (Exception ex)
                 {
-                    Trace.WriteLine($"[AudioRoute] Failed to register audio session watchers: flow={flow}, index={index}, {ex}");
+                    RuntimeLog.WriteException($"注册音频会话监听器失败: flow={flow}, index={index}", ex);
                 }
                 finally
                 {
@@ -379,7 +482,7 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         }
         catch (Exception ex)
         {
-            Trace.WriteLine($"[AudioRoute] Failed to enumerate audio session watcher targets: flow={flow}, {ex}");
+            RuntimeLog.WriteException($"枚举音频会话监听目标失败: flow={flow}", ex);
         }
     }
 
@@ -391,38 +494,52 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         var sessionId = GetSessionIdentity(session);
         var sessionKey = GetAppSessionKey(session);
 
-        lock (syncRoot)
-        {
-            if (disposed || sessionRegistrations.ContainsKey(sessionId))
-                return false;
-        }
+        if (disposed || sessionRegistrations.ContainsKey(sessionId))
+            return false;
 
         var handler = new SessionEventsHandler(
             onSessionStateChanged: state => HandleSessionStateChanged(sessionId, flow, state),
-            onSessionDisconnected: () => RemoveSessionAndRaiseStructureChanged(sessionId, flow),
+            onSessionDisconnected: () => QueueSessionRemoval(sessionId, flow),
             onDisplayNameChanged: displayName => HandleSessionDisplayNameChanged(sessionKey, flow, displayName),
             onVolumeChanged: (volume, isMuted) => HandleSessionVolumeChanged(sessionKey, flow, volume, isMuted));
 
         session.RegisterEventClient(handler);
         var registration = new SessionRegistration(sessionId, sessionKey, flow, session, handler);
-        var added = false;
-
-        lock (syncRoot)
+        if (!disposed && !sessionRegistrations.ContainsKey(sessionId))
         {
-            if (!disposed && !sessionRegistrations.ContainsKey(sessionId))
-            {
-                sessionRegistrations.Add(sessionId, registration);
-                added = true;
-            }
+            sessionRegistrations.Add(sessionId, registration);
+            return true;
         }
 
-        if (!added)
-            registration.Dispose();
-
-        return added;
+        registration.Dispose();
+        return false;
     }
 
-    private void HandleSessionCreated(EDataFlow flow, object? sender, IAudioSessionControl newSessionControl)
+    private void QueueSessionCreated(EDataFlow flow, IAudioSessionControl newSessionControl)
+    {
+        if (disposed)
+            return;
+
+        try
+        {
+            var work = monitorDispatcher.InvokeAsync(() => TrackSessionCreatedCore(flow, newSessionControl));
+            _ = work.ContinueWith(
+                completedWork =>
+                {
+                    if (completedWork.Exception is not null)
+                        RuntimeLog.WriteException("后台监听新音频会话失败", completedWork.Exception.GetBaseException());
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+        catch (Exception ex)
+        {
+            RuntimeLog.WriteException("投递新音频会话监听任务失败", ex);
+        }
+    }
+
+    private void TrackSessionCreatedCore(EDataFlow flow, IAudioSessionControl newSessionControl)
     {
         AudioSessionControl? session = null;
         var shouldRaise = false;
@@ -439,7 +556,7 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         }
         catch (Exception ex)
         {
-            Trace.WriteLine($"[AudioRoute] Failed to track new audio session: {ex}");
+            RuntimeLog.WriteException("监听新音频会话失败", ex);
             shouldRaise = true;
         }
         finally
@@ -454,7 +571,7 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
     private void HandleSessionStateChanged(string sessionId, EDataFlow flow, NAudioAudioSessionState state)
     {
         if (state == NAudioAudioSessionState.AudioSessionStateExpired)
-            RemoveSessionAndRaiseStructureChanged(sessionId, flow);
+            QueueSessionRemoval(sessionId, flow);
     }
 
     private void HandleSessionVolumeChanged(string sessionKey, EDataFlow flow, float volume, bool isMuted)
@@ -483,13 +600,35 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
 
     private void RemoveSessionAndRaiseStructureChanged(string sessionId, EDataFlow flow)
     {
-        SessionRegistration? removedRegistration;
-        lock (syncRoot)
-            removedRegistration = RemoveSessionCore(sessionId);
+        var removedRegistration = RemoveSessionCore(sessionId);
 
         removedRegistration?.Dispose();
 
         RaiseSessionStructureChanged(flow);
+    }
+
+    private void QueueSessionRemoval(string sessionId, EDataFlow flow)
+    {
+        if (disposed)
+            return;
+
+        try
+        {
+            var work = monitorDispatcher.InvokeAsync(() => RemoveSessionAndRaiseStructureChanged(sessionId, flow));
+            _ = work.ContinueWith(
+                completedWork =>
+                {
+                    if (completedWork.Exception is not null)
+                        RuntimeLog.WriteException("后台移除音频会话监听器失败", completedWork.Exception.GetBaseException());
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+        catch (Exception ex)
+        {
+            RuntimeLog.WriteException("投递音频会话移除任务失败", ex);
+        }
     }
 
     private SessionRegistration? RemoveSessionCore(string sessionId)
@@ -520,13 +659,41 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         IReadOnlyList<SessionRegistration> previousSessionRegistrations,
         IReadOnlyList<DeviceRegistration> previousDeviceRegistrations)
     {
-        previousDefaultRegistration?.Dispose();
+        var startedAt = Stopwatch.GetTimestamp();
+        RuntimeLog.Write(
+            $"监听器释放旧订阅: begin, endpoint={previousDefaultRegistration is not null}, " +
+            $"sessions={previousSessionRegistrations.Count}, devices={previousDeviceRegistrations.Count}");
 
+        RuntimeLog.Write("监听器释放默认端点订阅: begin");
+        DisposeRegistration(previousDefaultRegistration, "释放默认端点订阅失败");
+        RuntimeLog.Write("监听器释放默认端点订阅: done");
+
+        RuntimeLog.Write($"监听器释放会话订阅: begin, count={previousSessionRegistrations.Count}");
         foreach (var registration in previousSessionRegistrations)
-            registration.Dispose();
+            DisposeRegistration(registration, $"释放会话订阅失败: session={registration.SessionId}");
+        RuntimeLog.Write("监听器释放会话订阅: done");
 
+        RuntimeLog.Write($"监听器释放设备订阅: begin, count={previousDeviceRegistrations.Count}");
         foreach (var registration in previousDeviceRegistrations)
+            DisposeRegistration(registration, "释放设备会话创建订阅失败");
+        RuntimeLog.Write("监听器释放设备订阅: done");
+
+        RuntimeLog.Write($"监听器释放旧订阅: done, elapsed={Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds:F0}ms");
+    }
+
+    private static void DisposeRegistration(IDisposable? registration, string failureContext)
+    {
+        if (registration is null)
+            return;
+
+        try
+        {
             registration.Dispose();
+        }
+        catch (Exception ex)
+        {
+            RuntimeLog.WriteException(failureContext, ex);
+        }
     }
 
     private void RaiseChanged()
@@ -623,7 +790,7 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
             }
             catch (Exception ex)
             {
-                Trace.WriteLine($"[AudioRoute] Failed to unregister session-created listener: {ex}");
+                RuntimeLog.WriteException("注销音频会话创建监听器失败", ex);
             }
 
             SessionManager.Dispose();
@@ -660,7 +827,7 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
             }
             catch (Exception ex)
             {
-                Trace.WriteLine($"[AudioRoute] Failed to unregister session event listener: session={SessionId}, {ex}");
+                RuntimeLog.WriteException($"注销音频会话事件监听器失败: session={SessionId}", ex);
             }
 
             Session.Dispose();
@@ -693,7 +860,7 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
             }
             catch (Exception ex)
             {
-                Trace.WriteLine($"[AudioRoute] Failed to unregister endpoint volume listener: {ex}");
+                RuntimeLog.WriteException("注销默认端点音量监听器失败", ex);
             }
 
             EndpointVolume.Dispose();

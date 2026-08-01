@@ -21,6 +21,18 @@ public partial class App : Application
 
     public App()
     {
+        UnhandledException += (_, eventArgs) =>
+            RuntimeLog.WriteException("WinUI 未处理异常", eventArgs.Exception);
+        AppDomain.CurrentDomain.UnhandledException += (_, eventArgs) =>
+        {
+            if (eventArgs.ExceptionObject is Exception exception)
+                RuntimeLog.WriteException($"进程未处理异常: terminating={eventArgs.IsTerminating}", exception);
+            else
+                RuntimeLog.Write($"进程未处理异常: terminating={eventArgs.IsTerminating}, value={eventArgs.ExceptionObject}");
+        };
+        TaskScheduler.UnobservedTaskException += (_, eventArgs) =>
+            RuntimeLog.WriteException("未观察到的后台任务异常", eventArgs.Exception);
+
         singleInstanceMutex = new Mutex(initiallyOwned: true, SingleInstanceMutexName, out var createdNew);
         isPrimaryInstance = createdNew;
         activationEvent = new EventWaitHandle(false, EventResetMode.AutoReset, SingleInstanceActivationEventName);

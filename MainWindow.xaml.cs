@@ -72,14 +72,19 @@ public sealed partial class MainWindow : Window
 
     public MainWindow()
     {
-        RuntimeLog.Reset();
-        RuntimeLog.Write("应用启动");
+        RuntimeLog.BeginSession();
+        var assembly = typeof(MainWindow).Assembly;
+        var fileVersion = FileVersionInfo.GetVersionInfo(assembly.Location);
+        RuntimeLog.Write(
+            $"应用启动: assemblyVersion={assembly.GetName().Version}, " +
+            $"fileVersion={fileVersion.FileVersion}, productVersion={fileVersion.ProductVersion}, " +
+            $"processId={Environment.ProcessId}, os={Environment.OSVersion}");
         Interlocked.Exchange(ref lastObservedMasterVolumeEventTick, Environment.TickCount64);
         InitializeComponent();
         refreshDispatcher = new StaThreadDispatcher("AudioRoute.Refresh");
         trayDispatcher = new StaThreadDispatcher("AudioRoute.Tray");
         trayIconHost = new ShellNotifyIconHost(TrayIconGuid, TrayIconId, TrayCallbackMessage);
-        trayIconManager = new TrayIconManager(() => hwnd, trayIconHost);
+        trayIconManager = new TrayIconManager(() => hwnd, trayIconHost, DispatcherQueue);
         trayIconManager.TogglePanelRequested += () => { _ = TogglePanelVisibilityAsync(); return Task.CompletedTask; };
         trayIconManager.ShowPanelRequested += () => { _ = ShowOrBringToFrontAsync(); return Task.CompletedTask; };
         trayIconManager.ExitRequested += RequestExit;
@@ -135,7 +140,7 @@ public sealed partial class MainWindow : Window
             }
             catch (Exception ex)
             {
-                Trace.WriteLine($"[AudioRoute] 主音量轮询失败: {ex}");
+                RuntimeLog.WriteException("主音量轮询失败", ex);
             }
             finally
             {
@@ -468,7 +473,7 @@ public sealed partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            Trace.WriteLine($"[AudioRoute] 刷新音频会话失败: {ex}");
+            RuntimeLog.WriteException("刷新音频会话失败", ex);
             if (refreshVersion == refreshGeneration && panelController.IsPanelVisible)
                 ShowPlaceholder($"刷新音频会话失败: {ex.Message}");
         }
@@ -694,7 +699,7 @@ public sealed partial class MainWindow : Window
             }));
     }
 
-    private void OnDeviceChanged(object? sender, MixerDeviceChangedEventArgs e)
+    private async void OnDeviceChanged(object? sender, MixerDeviceChangedEventArgs e)
     {
         try
         {
@@ -708,9 +713,9 @@ public sealed partial class MainWindow : Window
             }
 
             if (string.IsNullOrWhiteSpace(e.DeviceId))
-                AudioPolicyManager.ClearAppDefaultDevice((uint)e.Session.ProcessId, e.Session.Flow);
+                await AudioPolicyManager.ClearAppDefaultDeviceAsync((uint)e.Session.ProcessId, e.Session.Flow);
             else
-                AudioPolicyManager.SetAppDefaultDevice((uint)e.Session.ProcessId, e.DeviceId, e.Session.Flow);
+                await AudioPolicyManager.SetAppDefaultDeviceAsync((uint)e.Session.ProcessId, e.DeviceId, e.Session.Flow);
 
             UpdateCachedSessionRoute(e.Session.SessionKey, e.Session.Flow, e.DeviceId, e.SelectedDeviceSummary);
             isSnapshotStale = true;
@@ -720,7 +725,7 @@ public sealed partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            Trace.WriteLine($"[AudioRoute] 更改设备失败: {ex}");
+            RuntimeLog.WriteException("更改设备失败", ex);
             hasDeferredRefresh = true;
             deferredRefreshCanReuseDevices = false;
             RefreshData();
@@ -784,7 +789,7 @@ public sealed partial class MainWindow : Window
                             }
                             catch (Exception ex)
                             {
-                                Trace.WriteLine($"[AudioRoute] 快速调节音量路径失败，回退到枚举路径: {ex}");
+                                RuntimeLog.WriteException("快速调节音量路径失败，回退到枚举路径", ex);
                             }
 
                             if (!updated)
@@ -820,8 +825,9 @@ public sealed partial class MainWindow : Window
             foreach (var failure in result.Failures)
             {
                 failure.Commit.SourceCard?.NotifyVolumeCommitFailed();
-                RuntimeLog.Write($"主页调节音量: failed session={failure.Commit.Change.Session.SessionKey}, flow={failure.Commit.Change.Session.Flow}, message={failure.Exception.Message}");
-                Trace.WriteLine($"[AudioRoute] 调整音量失败: {failure.Exception}");
+                RuntimeLog.WriteException(
+                    $"主页调节音量失败: session={failure.Commit.Change.Session.SessionKey}, flow={failure.Commit.Change.Session.Flow}",
+                    failure.Exception);
             }
 
             hasDeferredRefresh = true;
