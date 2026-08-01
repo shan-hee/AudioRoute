@@ -104,6 +104,15 @@ jobs:
             }
           }
 
+          $expectedFileVersion = "$env:VERSION.0"
+          foreach ($binary in @("AudioRoute.exe", "AudioRoute.dll")) {
+            $binaryPath = Join-Path $sourceDir $binary
+            $actualFileVersion = (Get-Item -LiteralPath $binaryPath).VersionInfo.FileVersion
+            if ($actualFileVersion -ne $expectedFileVersion) {
+              throw "$binary version mismatch: VERSION=$env:VERSION, FileVersion=$actualFileVersion. Rebuild release-assets before publishing."
+            }
+          }
+
       - name: Package release assets
         shell: pwsh
         run: |

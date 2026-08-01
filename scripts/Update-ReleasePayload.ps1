@@ -45,4 +45,14 @@ if (-not (Test-Path $buildOutputDir)) {
 
 Copy-Item (Join-Path $buildOutputDir "*") -Destination $payloadDir -Recurse -Force
 
+$version = (Get-Content -Raw (Join-Path $repoRoot "VERSION")).Trim()
+$expectedFileVersion = "$version.0"
+foreach ($binary in @("AudioRoute.exe", "AudioRoute.dll")) {
+    $binaryPath = Join-Path $payloadDir $binary
+    $actualFileVersion = (Get-Item -LiteralPath $binaryPath).VersionInfo.FileVersion
+    if ($actualFileVersion -ne $expectedFileVersion) {
+        throw "$binary version mismatch after build: VERSION=$version, FileVersion=$actualFileVersion"
+    }
+}
+
 Write-Host "Release payload updated: $payloadDir"

@@ -1,4 +1,6 @@
-Update the local release payload in `release-assets/win-x64/` before committing.
+Update `VERSION` first, then rebuild the local release payload in
+`release-assets/win-x64/` before committing. The release workflow rejects a
+payload whose executable or DLL file version does not match `VERSION`.
 
 Recommended flow:
 
