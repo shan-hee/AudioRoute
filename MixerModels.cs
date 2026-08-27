@@ -1,5 +1,8 @@
 ﻿using System;
 
+using System.Collections.Generic;
+using System.Linq;
+
 namespace AudioRoute;
 
 public sealed record MixerSessionInfo
@@ -11,7 +14,9 @@ public sealed record MixerSessionInfo
     public string ProcessName { get; init; } = string.Empty;
     public string? ExecutablePath { get; init; }
     public string? BoundDeviceId { get; init; }
+    public string? VolumeDeviceId { get; init; }
     public string? RoutingUnavailableReason { get; init; }
+    public IReadOnlyList<MixerDeviceSessionState> DeviceStates { get; init; } = Array.Empty<MixerDeviceSessionState>();
     public EDataFlow Flow { get; init; }
     public int ProcessId { get; init; }
     public float Volume { get; init; }
@@ -31,7 +36,9 @@ public sealed record MixerSessionInfo
             string.Equals(ProcessName, other.ProcessName, StringComparison.Ordinal) &&
             string.Equals(ExecutablePath, other.ExecutablePath, StringComparison.OrdinalIgnoreCase) &&
             string.Equals(BoundDeviceId, other.BoundDeviceId, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(VolumeDeviceId, other.VolumeDeviceId, StringComparison.OrdinalIgnoreCase) &&
             string.Equals(RoutingUnavailableReason, other.RoutingUnavailableReason, StringComparison.Ordinal) &&
+            DeviceStatesEqual(DeviceStates, other.DeviceStates) &&
             Flow == other.Flow &&
             ProcessId == other.ProcessId &&
             Math.Abs(Volume - other.Volume) < 0.001f &&
@@ -44,7 +51,79 @@ public sealed record MixerSessionInfo
     {
         return StringComparer.OrdinalIgnoreCase.GetHashCode(SessionKey ?? string.Empty);
     }
+
+    public MixerSessionInfo SelectVolumeDevice(string? deviceId)
+    {
+        if (string.IsNullOrWhiteSpace(deviceId))
+            return this;
+
+        var deviceState = DeviceStates.FirstOrDefault(state =>
+            string.Equals(state.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase));
+
+        return deviceState is null
+            ? this with { VolumeDeviceId = deviceId }
+            : this with
+            {
+                VolumeDeviceId = deviceState.DeviceId,
+                Volume = deviceState.Volume,
+                IsMuted = deviceState.IsMuted
+            };
+    }
+
+    public MixerSessionInfo WithDeviceVolume(string deviceId, string deviceName, float volume, bool isMuted)
+    {
+        if (string.IsNullOrWhiteSpace(deviceId))
+            return this with { Volume = volume, IsMuted = isMuted };
+
+        var updatedStates = new List<MixerDeviceSessionState>(DeviceStates.Count + 1);
+        var found = false;
+
+        foreach (var state in DeviceStates)
+        {
+            if (!string.Equals(state.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase))
+            {
+                updatedStates.Add(state);
+                continue;
+            }
+
+            updatedStates.Add(state with { DeviceName = deviceName, Volume = volume, IsMuted = isMuted });
+            found = true;
+        }
+
+        if (!found)
+            updatedStates.Add(new MixerDeviceSessionState(deviceId, deviceName, volume, isMuted));
+
+        var updated = this with { DeviceStates = updatedStates };
+        return string.Equals(VolumeDeviceId, deviceId, StringComparison.OrdinalIgnoreCase)
+            ? updated with { Volume = volume, IsMuted = isMuted }
+            : updated;
+    }
+
+    private static bool DeviceStatesEqual(
+        IReadOnlyList<MixerDeviceSessionState> left,
+        IReadOnlyList<MixerDeviceSessionState> right)
+    {
+        if (ReferenceEquals(left, right))
+            return true;
+
+        if (left.Count != right.Count)
+            return false;
+
+        for (var index = 0; index < left.Count; index++)
+        {
+            if (left[index] != right[index])
+                return false;
+        }
+
+        return true;
+    }
 }
+
+public sealed record MixerDeviceSessionState(
+    string DeviceId,
+    string DeviceName,
+    float Volume,
+    bool IsMuted);
 
 public sealed class MixerAppSessionInfo
 {
@@ -105,17 +184,20 @@ public sealed class MixerDeviceChangedEventArgs : EventArgs
     public string SelectedDeviceSummary { get; }
 }
 
-public sealed class MixerVolumeChangedEventArgs : EventArgs
+public sealed class MixerSessionStateChangedEventArgs : EventArgs
 {
-    public MixerVolumeChangedEventArgs(MixerSessionInfo session, float volume)
+    public MixerSessionStateChangedEventArgs(MixerSessionInfo session, float volume, bool isMuted)
     {
         Session = session;
         Volume = volume;
+        IsMuted = isMuted;
     }
 
     public MixerSessionInfo Session { get; }
 
     public float Volume { get; }
+
+    public bool IsMuted { get; }
 }
 
 public sealed class MixerInteractionStateChangedEventArgs : EventArgs

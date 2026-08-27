@@ -25,6 +25,10 @@
     <PackageReference Include="NAudio" Version="2.2.1" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Remove="AudioRoute.Tests\**\*.cs" />
+  </ItemGroup>
+
   <Target Name="ValidateVersionFromFile" BeforeTargets="PrepareForBuild">
     <Error Condition="!Exists('$(VersionFile)')" Text="VERSION file not found: $(VersionFile)" />
     <Error Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(VersionFileValue)', '$(VersionRegexPattern)')) != 'True'" Text="VERSION must use major.minor.patch format. Current value: '$(VersionFileValue)'" />

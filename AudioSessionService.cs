@@ -51,7 +51,11 @@ public static class AudioSessionService
                         var simpleAudioVolume = session.SimpleAudioVolume;
                         try
                         {
-                            aggregate.AddSample(audioDevice.FriendlyName, simpleAudioVolume.Volume, simpleAudioVolume.Mute);
+                            aggregate.AddSample(
+                                audioDevice.ID,
+                                audioDevice.FriendlyName,
+                                simpleAudioVolume.Volume,
+                                simpleAudioVolume.Mute);
                         }
                         finally
                         {
@@ -77,16 +81,22 @@ public static class AudioSessionService
             .ToList();
     }
 
-    public static void SetSessionVolume(string sessionKey, EDataFlow flow, float volume)
+    public static bool SetSessionState(
+        string sessionKey,
+        EDataFlow flow,
+        string? deviceId,
+        float volume,
+        bool isMuted)
     {
         var clampedVolume = Math.Clamp(volume, 0f, 1f);
         var sessionMatcher = SessionMatcher.Create(sessionKey);
-        UpdateMatchingSessions(sessionMatcher, flow, session =>
+        return UpdateMatchingSessions(sessionMatcher, flow, deviceId, session =>
         {
             var simpleAudioVolume = session.SimpleAudioVolume;
             try
             {
                 simpleAudioVolume.Volume = clampedVolume;
+                simpleAudioVolume.Mute = isMuted;
             }
             finally
             {
@@ -95,14 +105,25 @@ public static class AudioSessionService
         });
     }
 
-    private static void UpdateMatchingSessions(SessionMatcher sessionMatcher, EDataFlow flow, Action<AudioSessionControl> update)
+    private static bool UpdateMatchingSessions(
+        SessionMatcher sessionMatcher,
+        EDataFlow flow,
+        string? deviceId,
+        Action<AudioSessionControl> update)
     {
+        var updated = false;
         using var enumerator = new MMDeviceEnumerator();
         var audioDevices = enumerator.EnumerateAudioEndPoints(ToNaudioFlow(flow), NAudioDeviceState.Active);
 
         for (var deviceIndex = 0; deviceIndex < audioDevices.Count; deviceIndex++)
         {
             using var audioDevice = audioDevices[deviceIndex];
+            if (!string.IsNullOrWhiteSpace(deviceId) &&
+                !string.Equals(audioDevice.ID, deviceId, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
             var audioSessionManager = audioDevice.AudioSessionManager;
             try
             {
@@ -116,6 +137,7 @@ public static class AudioSessionService
                             continue;
 
                         update(session);
+                        updated = true;
                     }
                 }
                 finally
@@ -128,6 +150,8 @@ public static class AudioSessionService
                 DisposeIfNeeded(audioSessionManager);
             }
         }
+
+        return updated;
     }
 
     private static SessionAggregate CreateAggregate(AudioSessionControl session, EDataFlow flow, int processId)
@@ -287,10 +311,7 @@ public static class AudioSessionService
 
     private sealed class SessionAggregate
     {
-        private readonly HashSet<string> actualDeviceNames = new(StringComparer.OrdinalIgnoreCase);
-        private int sampleCount;
-        private float totalVolume;
-        private bool muted = true;
+        private readonly Dictionary<string, DeviceSessionAggregate> deviceSessions = new(StringComparer.OrdinalIgnoreCase);
 
         public SessionAggregate(string sessionKey, int processId, EDataFlow flow, string displayName, string processName, string? executablePath, bool isSystemSession)
         {
@@ -317,14 +338,18 @@ public static class AudioSessionService
 
         public bool IsSystemSession { get; }
 
-        public void AddSample(string actualDeviceName, float volume, bool isMuted)
+        public void AddSample(string deviceId, string deviceName, float volume, bool isMuted)
         {
-            if (!string.IsNullOrWhiteSpace(actualDeviceName))
-                actualDeviceNames.Add(actualDeviceName);
+            if (string.IsNullOrWhiteSpace(deviceId))
+                return;
 
-            totalVolume += volume;
-            sampleCount++;
-            muted &= isMuted;
+            if (!deviceSessions.TryGetValue(deviceId, out var aggregate))
+            {
+                aggregate = new DeviceSessionAggregate(deviceId, deviceName);
+                deviceSessions.Add(deviceId, aggregate);
+            }
+
+            aggregate.AddSample(volume, isMuted);
         }
 
         public MixerSessionInfo ToSnapshot(EDataFlow flow, IReadOnlyDictionary<string, AudioDevice> deviceMap, AudioRoutingSupport routingSupport)
@@ -346,12 +371,29 @@ public static class AudioSessionService
                     boundDeviceSummary = boundDeviceId;
             }
 
+            var deviceStates = deviceSessions.Values
+                .Select(aggregate => aggregate.ToSnapshot())
+                .OrderBy(state => state.DeviceName, StringComparer.CurrentCultureIgnoreCase)
+                .ToList();
+            var actualDeviceNames = deviceStates
+                .Select(state => state.DeviceName)
+                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
             var actualSummary = actualDeviceNames.Count switch
             {
                 0 => "无活跃会话",
-                1 => actualDeviceNames.First(),
+                1 => actualDeviceNames[0],
                 _ => $"多个设备: {string.Join(", ", actualDeviceNames.Take(3))}"
             };
+
+            var preferredDeviceId = boundDeviceId;
+            if (string.IsNullOrWhiteSpace(preferredDeviceId))
+                preferredDeviceId = deviceMap.Values.FirstOrDefault(device => device.IsDefault)?.Id;
+
+            var volumeState = deviceStates.FirstOrDefault(state =>
+                    string.Equals(state.DeviceId, preferredDeviceId, StringComparison.OrdinalIgnoreCase))
+                ?? deviceStates.FirstOrDefault();
 
             return new MixerSessionInfo
             {
@@ -361,15 +403,50 @@ public static class AudioSessionService
                 ExecutablePath = ExecutablePath,
                 Flow = Flow,
                 ProcessId = ProcessId,
-                Volume = sampleCount == 0 ? 0f : totalVolume / sampleCount,
-                IsMuted = muted,
+                Volume = volumeState?.Volume ?? 0f,
+                IsMuted = volumeState?.IsMuted ?? true,
                 IsSystemSession = IsSystemSession,
                 IsRoutingSupported = routingSupport.IsSupported,
                 RoutingUnavailableReason = routingUnavailableReason,
                 ActualDeviceSummary = actualSummary,
                 BoundDeviceId = boundDeviceId,
-                BoundDeviceSummary = boundDeviceSummary
+                BoundDeviceSummary = boundDeviceSummary,
+                VolumeDeviceId = volumeState?.DeviceId ?? preferredDeviceId,
+                DeviceStates = deviceStates
             };
+        }
+    }
+
+    private sealed class DeviceSessionAggregate
+    {
+        private int sampleCount;
+        private float totalVolume;
+        private bool muted = true;
+
+        public DeviceSessionAggregate(string deviceId, string deviceName)
+        {
+            DeviceId = deviceId;
+            DeviceName = deviceName;
+        }
+
+        public string DeviceId { get; }
+
+        public string DeviceName { get; }
+
+        public void AddSample(float volume, bool isMuted)
+        {
+            totalVolume += volume;
+            sampleCount++;
+            muted &= isMuted;
+        }
+
+        public MixerDeviceSessionState ToSnapshot()
+        {
+            return new MixerDeviceSessionState(
+                DeviceId,
+                DeviceName,
+                sampleCount == 0 ? 0f : totalVolume / sampleCount,
+                muted);
         }
     }
 

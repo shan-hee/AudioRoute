@@ -22,6 +22,8 @@ public sealed partial class SessionCardControl : UserControl
     private float lastAudibleVolume = 1f;
     private float? pendingUiVolume;
     private DateTimeOffset pendingUiVolumeUntil;
+    private bool? pendingUiMuted;
+    private DateTimeOffset pendingUiMutedUntil;
     private bool isMuted;
     private string? loadedIconPath;
     private int iconLoadVersion;
@@ -37,7 +39,7 @@ public sealed partial class SessionCardControl : UserControl
 
     public event EventHandler<MixerDeviceChangedEventArgs>? DeviceChanged;
 
-    public event EventHandler<MixerVolumeChangedEventArgs>? VolumeChanged;
+    public event EventHandler<MixerSessionStateChangedEventArgs>? SessionStateChanged;
 
     public event EventHandler<MixerInteractionStateChangedEventArgs>? InteractionStateChanged;
 
@@ -49,20 +51,21 @@ public sealed partial class SessionCardControl : UserControl
         ApplySession();
     }
 
-    public void NotifyVolumeCommitFailed()
+    public void NotifySessionStateCommitFailed()
     {
-        ClearPendingVolumeOverride();
+        ClearPendingSessionStateOverride();
         lastCommittedVolume = VolumeSession?.Volume ?? lastCommittedVolume;
         if (lastCommittedVolume > 0.005f)
             lastAudibleVolume = lastCommittedVolume;
     }
 
-    public void ApplyObservedVolume(EDataFlow flow, float volume, bool muted)
+    public void ApplyObservedVolume(EDataFlow flow, string deviceId, float volume, bool muted)
     {
-        if (!TryUpdateSessionVolume(flow, volume, muted))
+        if (!TryUpdateSessionVolume(flow, deviceId, volume, muted))
             return;
 
-        if (flow != volumeFlow)
+        if (flow != volumeFlow ||
+            !string.Equals(VolumeSession?.VolumeDeviceId, deviceId, StringComparison.OrdinalIgnoreCase))
             return;
 
         if (isVolumeInteracting)
@@ -70,15 +73,19 @@ public sealed partial class SessionCardControl : UserControl
             if (pendingUiVolume is float optimisticVolume && Math.Abs(optimisticVolume - volume) < 0.01f)
                 ClearPendingVolumeOverride();
 
+            if (pendingUiMuted == muted)
+                ClearPendingMuteOverride();
+
             return;
         }
 
         var displayVolume = ResolveDisplayedVolume(volume);
+        var displayMuted = ResolveDisplayedMute(muted);
         hasPendingVolumeCommit = false;
         lastCommittedVolume = displayVolume;
         if (displayVolume > 0.005f)
             lastAudibleVolume = displayVolume;
-        isMuted = muted;
+        isMuted = displayMuted;
         updatingUi = true;
         VolumeSlider.Value = Math.Clamp((int)Math.Round(displayVolume * 100), 0, 100);
         updatingUi = false;
@@ -129,14 +136,15 @@ public sealed partial class SessionCardControl : UserControl
         var volumeSession = VolumeSession;
         if (volumeSession is null)
         {
-            ClearPendingVolumeOverride();
+            ClearPendingSessionStateOverride();
             VolumeSlider.IsEnabled = false;
             MuteButton.IsEnabled = false;
+            VolumeValueTextBlock.Text = "--";
             ToolTipService.SetToolTip(VolumeSlider, null);
             return;
         }
 
-        isMuted = volumeSession.IsMuted;
+        isMuted = ResolveDisplayedMute(volumeSession.IsMuted);
         VolumeSlider.IsEnabled = true;
         MuteButton.IsEnabled = true;
         UpdateMuteIcon();
@@ -189,31 +197,16 @@ public sealed partial class SessionCardControl : UserControl
         if (VolumeSession is null)
             return;
 
-        if (VolumeSlider.Value <= 0)
+        var nextMuted = !(isMuted || VolumeSlider.Value <= 0);
+        if (!nextMuted && VolumeSlider.Value <= 0)
         {
             var restoreVolume = Math.Clamp(lastAudibleVolume, 0.05f, 1f);
-            isMuted = false;
             updatingUi = true;
             VolumeSlider.Value = Math.Clamp((int)Math.Round(restoreVolume * 100), 0, 100);
             updatingUi = false;
-            hasPendingVolumeCommit = true;
-            CommitVolumeChange();
-        }
-        else
-        {
-            var currentVolume = (float)(VolumeSlider.Value / 100d);
-            if (currentVolume > 0.005f)
-                lastAudibleVolume = currentVolume;
-
-            isMuted = false;
-            updatingUi = true;
-            VolumeSlider.Value = 0;
-            updatingUi = false;
-            hasPendingVolumeCommit = true;
-            CommitVolumeChange();
         }
 
-        UpdateMuteIcon();
+        CommitSessionState(nextMuted, force: true);
     }
 
     private void OutputRouteButton_Click(object sender, RoutedEventArgs e)
@@ -283,7 +276,13 @@ public sealed partial class SessionCardControl : UserControl
 
     private void ApplyOptimisticRouteSelection(MixerSessionInfo session, EDataFlow flow, string? deviceId, string title)
     {
-        var updatedSession = session with { BoundDeviceId = deviceId, BoundDeviceSummary = title };
+        var selectedDeviceId = deviceId ?? devices.FirstOrDefault(device =>
+            device.Flow == flow && device.IsDefault)?.Id;
+        var updatedSession = (session with
+        {
+            BoundDeviceId = deviceId,
+            BoundDeviceSummary = title
+        }).SelectVolumeDevice(selectedDeviceId);
         ReplaceSession(flow, updatedSession);
 
         ApplySession();
@@ -329,6 +328,8 @@ public sealed partial class SessionCardControl : UserControl
         if (updatingUi || VolumeSession is null)
             return;
 
+        var volume = (float)(VolumeSlider.Value / 100d);
+        isMuted = volume <= 0.005f;
         hasPendingVolumeCommit = true;
         CommitVolumeChange();
     }
@@ -336,7 +337,8 @@ public sealed partial class SessionCardControl : UserControl
     private void UpdateVolumeText()
     {
         var value = Math.Clamp((int)Math.Round(VolumeSlider.Value), 0, 100);
-        ToolTipService.SetToolTip(VolumeSlider, $"{value}%");
+        VolumeValueTextBlock.Text = value.ToString();
+        ToolTipService.SetToolTip(VolumeSlider, $"{appSession.DisplayName}：{value}");
     }
 
     private async System.Threading.Tasks.Task UpdateSessionIconAsync()
@@ -411,10 +413,38 @@ public sealed partial class SessionCardControl : UserControl
         }
 
         hasPendingVolumeCommit = false;
+        CommitSessionState(isMuted, force: false);
+    }
+
+    private void CommitSessionState(bool nextMuted, bool force)
+    {
+        var volumeSession = VolumeSession;
+        if (volumeSession is null)
+            return;
+
+        var volume = (float)(VolumeSlider.Value / 100d);
+        if (!force &&
+            Math.Abs(volume - lastCommittedVolume) < 0.005f &&
+            nextMuted == volumeSession.IsMuted)
+        {
+            return;
+        }
+
+        if (volume > 0.005f)
+            lastAudibleVolume = volume;
+
         lastCommittedVolume = volume;
+        isMuted = nextMuted;
         pendingUiVolume = volume;
         pendingUiVolumeUntil = DateTimeOffset.UtcNow + PendingVolumeSyncTimeout;
-        VolumeChanged?.Invoke(this, new MixerVolumeChangedEventArgs(volumeSession, volume));
+        pendingUiMuted = nextMuted;
+        pendingUiMutedUntil = DateTimeOffset.UtcNow + PendingVolumeSyncTimeout;
+
+        var updatedSession = UpdateCurrentDeviceState(volumeSession, volume, nextMuted);
+        ReplaceSession(volumeFlow, updatedSession);
+        UpdateMuteIcon();
+        UpdateVolumeText();
+        SessionStateChanged?.Invoke(this, new MixerSessionStateChangedEventArgs(updatedSession, volume, nextMuted));
     }
 
     private float ResolveDisplayedVolume(float snapshotVolume)
@@ -441,14 +471,57 @@ public sealed partial class SessionCardControl : UserControl
         pendingUiVolumeUntil = default;
     }
 
-    private bool TryUpdateSessionVolume(EDataFlow flow, float volume, bool muted)
+    private bool TryUpdateSessionVolume(EDataFlow flow, string deviceId, float volume, bool muted)
     {
         var session = appSession.GetSession(flow);
         if (session is null)
             return false;
 
-        ReplaceSession(flow, session with { Volume = volume, IsMuted = muted });
+        var deviceName = devices.FirstOrDefault(device =>
+            string.Equals(device.Id, deviceId, StringComparison.OrdinalIgnoreCase))?.Name ?? deviceId;
+        ReplaceSession(flow, session.WithDeviceVolume(deviceId, deviceName, volume, muted));
         return true;
+    }
+
+    private bool ResolveDisplayedMute(bool snapshotMuted)
+    {
+        if (pendingUiMuted is not bool optimisticMuted)
+            return snapshotMuted;
+
+        if (snapshotMuted == optimisticMuted)
+        {
+            ClearPendingMuteOverride();
+            return snapshotMuted;
+        }
+
+        if (DateTimeOffset.UtcNow <= pendingUiMutedUntil)
+            return optimisticMuted;
+
+        ClearPendingMuteOverride();
+        return snapshotMuted;
+    }
+
+    private void ClearPendingMuteOverride()
+    {
+        pendingUiMuted = null;
+        pendingUiMutedUntil = default;
+    }
+
+    private void ClearPendingSessionStateOverride()
+    {
+        ClearPendingVolumeOverride();
+        ClearPendingMuteOverride();
+    }
+
+    private MixerSessionInfo UpdateCurrentDeviceState(MixerSessionInfo session, float volume, bool muted)
+    {
+        if (string.IsNullOrWhiteSpace(session.VolumeDeviceId))
+            return session with { Volume = volume, IsMuted = muted };
+
+        var deviceName = devices.FirstOrDefault(device =>
+            string.Equals(device.Id, session.VolumeDeviceId, StringComparison.OrdinalIgnoreCase))?.Name
+            ?? session.VolumeDeviceId;
+        return session.WithDeviceVolume(session.VolumeDeviceId, deviceName, volume, muted);
     }
 
     private void ReplaceSession(EDataFlow flow, MixerSessionInfo updatedSession)

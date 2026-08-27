@@ -111,6 +111,7 @@
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="28" />
             </Grid.ColumnDefinitions>
 
             <Button x:Name="MuteButton"
@@ -139,6 +140,14 @@
                     PointerPressed="VolumeSlider_PointerPressed"
                     PointerReleased="VolumeSlider_PointerReleased"
                     PointerCaptureLost="VolumeSlider_PointerCaptureLost" />
+
+            <TextBlock x:Name="VolumeValueTextBlock"
+                       Grid.Column="2"
+                       FontSize="12"
+                       FontWeight="SemiBold"
+                       Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                       TextAlignment="Right"
+                       VerticalAlignment="Center" />
         </Grid>
     </Grid>
 </UserControl>

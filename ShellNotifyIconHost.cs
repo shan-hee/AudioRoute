@@ -13,16 +13,22 @@ internal sealed class ShellNotifyIconHost : IDisposable
     private const uint NifMessage = 0x00000001;
     private const uint NifIcon = 0x00000002;
     private const uint NifTip = 0x00000004;
-    private const uint NifGuid = 0x00000020;
     private const uint NifShowTip = 0x00000080;
     private const uint NotifyIconVersion4 = 4;
     private const uint WmThemeChanged = 0x031A;
     private const uint WmSettingChange = 0x001A;
     private const uint WmDisplayChange = 0x007E;
     private const uint WmDpiChanged = 0x02E0;
+    private const uint WmInput = 0x00FF;
+    private const uint RidInput = 0x10000003;
+    private const uint RimTypeMouse = 0;
+    private const uint RidevRemove = 0x00000001;
+    private const uint RidevInputSink = 0x00000100;
+    private const ushort HidUsagePageGeneric = 0x01;
+    private const ushort HidUsageMouse = 0x02;
+    private const ushort RiMouseWheel = 0x0400;
     private const int GwlWndProc = -4;
 
-    private readonly Guid guid;
     private readonly uint iconId;
     private readonly uint callbackMessage;
     private readonly uint taskbarCreatedMessage;
@@ -30,10 +36,10 @@ internal sealed class ShellNotifyIconHost : IDisposable
     private IntPtr windowHandle;
     private IntPtr originalWindowProc;
     private WndProcDelegate? windowProcDelegate;
+    private bool rawMouseInputRegistered;
 
-    public ShellNotifyIconHost(Guid guid, uint iconId, uint callbackMessage)
+    public ShellNotifyIconHost(uint iconId, uint callbackMessage)
     {
-        this.guid = guid;
         this.iconId = iconId;
         this.callbackMessage = callbackMessage;
         taskbarCreatedMessage = RegisterWindowMessage("TaskbarCreated");
@@ -44,6 +50,8 @@ internal sealed class ShellNotifyIconHost : IDisposable
     public event EventHandler? TaskbarCreated;
 
     public event EventHandler? EnvironmentChanged;
+
+    public event EventHandler<TrayIconScrolledEventArgs>? Scrolled;
 
     public bool IsCreated { get; private set; }
 
@@ -86,8 +94,7 @@ internal sealed class ShellNotifyIconHost : IDisposable
         {
             cbSize = (uint)Marshal.SizeOf<NotifyIconIdentifier>(),
             hWnd = windowHandle,
-            uID = iconId,
-            guidItem = guid
+            uID = iconId
         };
 
         if (ShellNotifyIconGetRect(ref identifier, out var nativeRect) != 0)
@@ -106,8 +113,7 @@ internal sealed class ShellNotifyIconHost : IDisposable
         {
             cbSize = (uint)Marshal.SizeOf<NotifyIconData>(),
             hWnd = windowHandle,
-            uID = iconId,
-            guidItem = guid
+            uID = iconId
         };
 
         _ = ShellNotifyIcon(NimSetFocus, ref data);
@@ -120,6 +126,8 @@ internal sealed class ShellNotifyIconHost : IDisposable
 
         disposed = true;
         DeleteIcon();
+
+        UnregisterRawMouseInput();
 
         if (windowHandle != IntPtr.Zero && originalWindowProc != IntPtr.Zero)
         {
@@ -161,6 +169,10 @@ internal sealed class ShellNotifyIconHost : IDisposable
         windowProcDelegate = WindowProc;
         var pointer = Marshal.GetFunctionPointerForDelegate(windowProcDelegate);
         originalWindowProc = SetWindowLongPtr(windowHandle, GwlWndProc, pointer);
+        rawMouseInputRegistered = RegisterRawMouseInput(windowHandle);
+        if (!rawMouseInputRegistered)
+            RuntimeLog.Write($"注册托盘滚轮原始输入失败: win32={Marshal.GetLastWin32Error()}");
+
         return true;
     }
 
@@ -177,7 +189,7 @@ internal sealed class ShellNotifyIconHost : IDisposable
 
     private NotifyIconData CreateNotifyIconData(IntPtr iconHandle, string toolTip)
     {
-        var flags = NifMessage | NifGuid;
+        var flags = NifMessage;
 
         if (iconHandle != IntPtr.Zero)
             flags |= NifIcon;
@@ -196,8 +208,7 @@ internal sealed class ShellNotifyIconHost : IDisposable
             szTip = toolTip,
             szInfo = string.Empty,
             szInfoTitle = string.Empty,
-            uVersionOrTimeout = 0,
-            guidItem = guid
+            uVersionOrTimeout = 0
         };
     }
 
@@ -225,6 +236,13 @@ internal sealed class ShellNotifyIconHost : IDisposable
             return IntPtr.Zero;
         }
 
+        if (message == WmInput &&
+            TryGetMouseWheelDelta(lParam, out var wheelDelta) &&
+            IsCursorWithinIconBounds())
+        {
+            Scrolled?.Invoke(this, new TrayIconScrolledEventArgs(wheelDelta));
+        }
+
         return originalWindowProc != IntPtr.Zero
             ? CallWindowProc(originalWindowProc, hWnd, message, wParam, lParam)
             : DefWindowProc(hWnd, message, wParam, lParam);
@@ -233,6 +251,87 @@ internal sealed class ShellNotifyIconHost : IDisposable
     private static uint GetLowWord(IntPtr value)
     {
         return (uint)(value.ToInt64() & 0xFFFF);
+    }
+
+    private bool IsCursorWithinIconBounds()
+    {
+        if (!TryGetIconRect(out var iconRect) || !GetCursorPos(out var cursorPosition))
+            return false;
+
+        return cursorPosition.X >= iconRect.Left &&
+            cursorPosition.X < iconRect.Right &&
+            cursorPosition.Y >= iconRect.Top &&
+            cursorPosition.Y < iconRect.Bottom;
+    }
+
+    private static bool RegisterRawMouseInput(IntPtr targetWindow)
+    {
+        var devices = new[]
+        {
+            new RawInputDevice
+            {
+                UsagePage = HidUsagePageGeneric,
+                Usage = HidUsageMouse,
+                Flags = RidevInputSink,
+                TargetWindow = targetWindow
+            }
+        };
+
+        return RegisterRawInputDevices(devices, 1, (uint)Marshal.SizeOf<RawInputDevice>());
+    }
+
+    private void UnregisterRawMouseInput()
+    {
+        if (!rawMouseInputRegistered)
+            return;
+
+        var devices = new[]
+        {
+            new RawInputDevice
+            {
+                UsagePage = HidUsagePageGeneric,
+                Usage = HidUsageMouse,
+                Flags = RidevRemove,
+                TargetWindow = IntPtr.Zero
+            }
+        };
+
+        _ = RegisterRawInputDevices(devices, 1, (uint)Marshal.SizeOf<RawInputDevice>());
+        rawMouseInputRegistered = false;
+    }
+
+    private static bool TryGetMouseWheelDelta(IntPtr rawInputHandle, out int wheelDelta)
+    {
+        wheelDelta = 0;
+        var headerSize = (uint)Marshal.SizeOf<RawInputHeader>();
+        uint bufferSize = 0;
+        if (GetRawInputData(rawInputHandle, RidInput, IntPtr.Zero, ref bufferSize, headerSize) != 0 ||
+            bufferSize < Marshal.SizeOf<RawInput>())
+        {
+            return false;
+        }
+
+        var buffer = Marshal.AllocHGlobal((int)bufferSize);
+        try
+        {
+            var bytesRead = GetRawInputData(rawInputHandle, RidInput, buffer, ref bufferSize, headerSize);
+            if (bytesRead != bufferSize)
+                return false;
+
+            var rawInput = Marshal.PtrToStructure<RawInput>(buffer);
+            if (rawInput.Header.Type != RimTypeMouse ||
+                (rawInput.Mouse.ButtonFlags & RiMouseWheel) == 0)
+            {
+                return false;
+            }
+
+            wheelDelta = unchecked((short)rawInput.Mouse.ButtonData);
+            return wheelDelta != 0;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
     }
 
     [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -272,6 +371,23 @@ internal sealed class ShellNotifyIconHost : IDisposable
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern uint RegisterWindowMessage(string lpString);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool RegisterRawInputDevices(
+        [In] RawInputDevice[] devices,
+        uint deviceCount,
+        uint structureSize);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint GetRawInputData(
+        IntPtr rawInput,
+        uint command,
+        IntPtr data,
+        ref uint size,
+        uint headerSize);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool GetCursorPos(out NativePoint point);
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct NotifyIconData
@@ -320,6 +436,59 @@ internal sealed class ShellNotifyIconHost : IDisposable
         public int Bottom;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RawInputDevice
+    {
+        public ushort UsagePage;
+        public ushort Usage;
+        public uint Flags;
+        public IntPtr TargetWindow;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RawInputHeader
+    {
+        public uint Type;
+        public uint Size;
+        public IntPtr Device;
+        public IntPtr WParam;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    private struct RawMouse
+    {
+        [FieldOffset(0)]
+        public ushort Flags;
+
+        [FieldOffset(4)]
+        public uint Buttons;
+
+        [FieldOffset(4)]
+        public ushort ButtonFlags;
+
+        [FieldOffset(6)]
+        public ushort ButtonData;
+
+        [FieldOffset(8)]
+        public uint RawButtons;
+
+        [FieldOffset(12)]
+        public int LastX;
+
+        [FieldOffset(16)]
+        public int LastY;
+
+        [FieldOffset(20)]
+        public uint ExtraInformation;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RawInput
+    {
+        public RawInputHeader Header;
+        public RawMouse Mouse;
+    }
+
     private delegate IntPtr WndProcDelegate(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 }
 
@@ -334,6 +503,16 @@ internal sealed class ShellNotifyIconMessageEventArgs : EventArgs
     public uint TrayMessage { get; }
 
     public IntPtr InvokePointData { get; }
+}
+
+internal sealed class TrayIconScrolledEventArgs : EventArgs
+{
+    public TrayIconScrolledEventArgs(int wheelDelta)
+    {
+        WheelDelta = wheelDelta;
+    }
+
+    public int WheelDelta { get; }
 }
 
 internal readonly record struct ShellNotifyIconRect(int Left, int Top, int Right, int Bottom);

@@ -34,6 +34,7 @@ internal sealed class TrayIconManager : IDisposable
         trayRetryTimer.IsRepeating = false;
         trayRetryTimer.Tick += OnTrayRetryTimerTick;
         trayIconHost.MessageReceived += OnTrayIconMessageReceived;
+        trayIconHost.Scrolled += OnTrayIconScrolled;
         trayIconHost.TaskbarCreated += OnTrayIconTaskbarCreated;
         trayIconHost.EnvironmentChanged += OnTrayIconEnvironmentChanged;
     }
@@ -42,6 +43,8 @@ internal sealed class TrayIconManager : IDisposable
     public event Func<Task>? ShowPanelRequested;
     public event Action? ExitRequested;
     public event Action<string>? ErrorOccurred;
+    public event Action<int>? MasterVolumeAdjustmentRequested;
+    public event Action? MasterMuteToggleRequested;
     public Func<bool>? IsPanelVisible { get; set; }
     public Action? CancelDeactivateHideRequested { get; set; }
 
@@ -123,7 +126,11 @@ internal sealed class TrayIconManager : IDisposable
         {
             cancelDeactivateHide();
             ShowTrayContextMenu(GetTrayMenuAnchorPoint(invokePointData));
+            return;
         }
+
+        if (trayMessage == NativeMethods.WmMButtonUp)
+            MasterMuteToggleRequested?.Invoke();
     }
 
     public void HandleTaskbarCreated()
@@ -156,6 +163,7 @@ internal sealed class TrayIconManager : IDisposable
         CancelTrayIconRetry();
         trayRetryTimer.Tick -= OnTrayRetryTimerTick;
         trayIconHost.MessageReceived -= OnTrayIconMessageReceived;
+        trayIconHost.Scrolled -= OnTrayIconScrolled;
         trayIconHost.TaskbarCreated -= OnTrayIconTaskbarCreated;
         trayIconHost.EnvironmentChanged -= OnTrayIconEnvironmentChanged;
         trayIconHost.Dispose();
@@ -197,7 +205,12 @@ internal sealed class TrayIconManager : IDisposable
             CancelTrayIconRetry();
             lastTrayVolumeState = currentState;
             if (!wasCreated)
-                RuntimeLog.Write($"托盘创建成功: state={FormatMasterVolumeStateForLog(currentState)}");
+            {
+                var location = trayIconHost.TryGetIconRect(out var iconRect)
+                    ? $"rect={iconRect.Left},{iconRect.Top},{iconRect.Right},{iconRect.Bottom}"
+                    : "rect=unavailable";
+                RuntimeLog.Write($"托盘创建成功: {location}, state={FormatMasterVolumeStateForLog(currentState)}");
+            }
         }
         catch (Exception ex)
         {
@@ -337,6 +350,13 @@ internal sealed class TrayIconManager : IDisposable
             e.InvokePointData,
             IsPanelVisible?.Invoke() ?? false,
             () => CancelDeactivateHideRequested?.Invoke());
+    }
+
+    private void OnTrayIconScrolled(object? sender, TrayIconScrolledEventArgs e)
+    {
+        var direction = Math.Sign(e.WheelDelta);
+        if (direction != 0)
+            MasterVolumeAdjustmentRequested?.Invoke(direction * 2);
     }
 
     private void OnTrayIconTaskbarCreated(object? sender, EventArgs e)

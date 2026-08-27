@@ -15,10 +15,11 @@ namespace AudioRoute;
 
 internal sealed class ObservedSessionVolumeChangedEventArgs : EventArgs
 {
-    public ObservedSessionVolumeChangedEventArgs(string sessionKey, EDataFlow flow, float volume, bool isMuted)
+    public ObservedSessionVolumeChangedEventArgs(string sessionKey, EDataFlow flow, string deviceId, float volume, bool isMuted)
     {
         SessionKey = sessionKey;
         Flow = flow;
+        DeviceId = deviceId;
         Volume = volume;
         IsMuted = isMuted;
     }
@@ -26,6 +27,8 @@ internal sealed class ObservedSessionVolumeChangedEventArgs : EventArgs
     public string SessionKey { get; }
 
     public EDataFlow Flow { get; }
+
+    public string DeviceId { get; }
 
     public float Volume { get; }
 
@@ -111,33 +114,46 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
 
     public event EventHandler<ObservedSessionStructureChangedEventArgs>? SessionStructureChanged;
 
-    public bool TrySetSessionVolume(string sessionKey, EDataFlow flow, float volume)
+    public bool TrySetSessionState(
+        string sessionKey,
+        EDataFlow flow,
+        string? deviceId,
+        float volume,
+        bool isMuted)
     {
         if (disposed)
             return false;
+
+        var clampedVolume = Math.Clamp(volume, 0f, 1f);
 
         return monitorDispatcher.Invoke(() =>
         {
             if (disposed)
                 return false;
 
-            if (TrySetSessionVolumeCore(sessionKey, flow, volume))
+            if (TrySetSessionStateCore(sessionKey, flow, deviceId, clampedVolume, isMuted))
                 return true;
 
             RebuildSubscriptions();
-            return TrySetSessionVolumeCore(sessionKey, flow, volume);
+            return TrySetSessionStateCore(sessionKey, flow, deviceId, clampedVolume, isMuted);
         });
     }
 
-    private bool TrySetSessionVolumeCore(string sessionKey, EDataFlow flow, float volume)
+    private bool TrySetSessionStateCore(
+        string sessionKey,
+        EDataFlow flow,
+        string? deviceId,
+        float volume,
+        bool isMuted)
     {
         List<SessionRegistration>? matchingRegistrations = null;
-        var clampedVolume = Math.Clamp(volume, 0f, 1f);
 
         foreach (var registration in sessionRegistrations.Values)
         {
             if (registration.Flow != flow ||
-                !string.Equals(registration.SessionKey, sessionKey, StringComparison.OrdinalIgnoreCase))
+                !string.Equals(registration.SessionKey, sessionKey, StringComparison.OrdinalIgnoreCase) ||
+                (!string.IsNullOrWhiteSpace(deviceId) &&
+                 !string.Equals(registration.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase)))
             {
                 continue;
             }
@@ -157,7 +173,9 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
                 var simpleAudioVolume = registration.Session.SimpleAudioVolume;
                 try
                 {
-                    simpleAudioVolume.Volume = clampedVolume;
+                    simpleAudioVolume.Volume = volume;
+                    simpleAudioVolume.Mute = isMuted;
+
                     updated = true;
                 }
                 finally
@@ -167,7 +185,9 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
             }
             catch (Exception ex)
             {
-                RuntimeLog.WriteException($"设置已监听会话音量失败: key={sessionKey}, flow={flow}", ex);
+                RuntimeLog.WriteException(
+                    $"设置已监听会话状态失败: key={sessionKey}, flow={flow}, device={registration.DeviceId}",
+                    ex);
             }
         }
 
@@ -389,8 +409,14 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         {
             var device = deviceEnumerator!.GetDefaultAudioEndpoint(NAudioDataFlow.Render, Role.Multimedia);
             var endpointVolume = device.AudioEndpointVolume;
+            var deviceId = device.ID;
+            var deviceName = device.FriendlyName;
             AudioEndpointVolumeNotificationDelegate notificationHandler = notification =>
-                HandleMasterVolumeNotification(notification.MasterVolume, notification.Muted);
+                HandleMasterVolumeNotification(
+                    notification.MasterVolume,
+                    notification.Muted,
+                    deviceId,
+                    deviceName);
 
             endpointVolume.OnVolumeNotification += notificationHandler;
             nextRegistration = new DefaultRenderEndpointRegistration(device, endpointVolume, notificationHandler);
@@ -431,11 +457,12 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
                 try
                 {
                     device = devices[index];
+                    var deviceId = device.ID;
                     sessionManager = device.AudioSessionManager;
 
                     AudioSessionManager.SessionCreatedDelegate sessionCreatedHandler =
-                        (_, newSessionControl) => QueueSessionCreated(appFlow, newSessionControl);
-                    var deviceRegistration = new DeviceRegistration(device, sessionManager, sessionCreatedHandler);
+                        (_, newSessionControl) => QueueSessionCreated(appFlow, deviceId, newSessionControl);
+                    var deviceRegistration = new DeviceRegistration(deviceId, device, sessionManager, sessionCreatedHandler);
                     sessionManager.OnSessionCreated += deviceRegistration.SessionCreatedHandler;
                     sessionManager.RefreshSessions();
 
@@ -460,7 +487,7 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
                         try
                         {
                             session = sessions[sessionIndex];
-                            if (TryTrackSessionCore(session, appFlow))
+                            if (TryTrackSessionCore(session, appFlow, deviceRegistration.DeviceId))
                                 session = null;
                         }
                         finally
@@ -486,12 +513,12 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         }
     }
 
-    private bool TryTrackSessionCore(AudioSessionControl session, EDataFlow flow)
+    private bool TryTrackSessionCore(AudioSessionControl session, EDataFlow flow, string deviceId)
     {
         if (disposed)
             return false;
 
-        var sessionId = GetSessionIdentity(session);
+        var sessionId = $"{deviceId}|{GetSessionIdentity(session)}";
         var sessionKey = GetAppSessionKey(session);
 
         if (disposed || sessionRegistrations.ContainsKey(sessionId))
@@ -501,10 +528,10 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
             onSessionStateChanged: state => HandleSessionStateChanged(sessionId, flow, state),
             onSessionDisconnected: () => QueueSessionRemoval(sessionId, flow),
             onDisplayNameChanged: displayName => HandleSessionDisplayNameChanged(sessionKey, flow, displayName),
-            onVolumeChanged: (volume, isMuted) => HandleSessionVolumeChanged(sessionKey, flow, volume, isMuted));
+            onVolumeChanged: (volume, isMuted) => HandleSessionVolumeChanged(sessionKey, flow, deviceId, volume, isMuted));
 
         session.RegisterEventClient(handler);
-        var registration = new SessionRegistration(sessionId, sessionKey, flow, session, handler);
+        var registration = new SessionRegistration(sessionId, sessionKey, flow, deviceId, session, handler);
         if (!disposed && !sessionRegistrations.ContainsKey(sessionId))
         {
             sessionRegistrations.Add(sessionId, registration);
@@ -515,14 +542,14 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         return false;
     }
 
-    private void QueueSessionCreated(EDataFlow flow, IAudioSessionControl newSessionControl)
+    private void QueueSessionCreated(EDataFlow flow, string deviceId, IAudioSessionControl newSessionControl)
     {
         if (disposed)
             return;
 
         try
         {
-            var work = monitorDispatcher.InvokeAsync(() => TrackSessionCreatedCore(flow, newSessionControl));
+            var work = monitorDispatcher.InvokeAsync(() => TrackSessionCreatedCore(flow, deviceId, newSessionControl));
             _ = work.ContinueWith(
                 completedWork =>
                 {
@@ -539,7 +566,7 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         }
     }
 
-    private void TrackSessionCreatedCore(EDataFlow flow, IAudioSessionControl newSessionControl)
+    private void TrackSessionCreatedCore(EDataFlow flow, string deviceId, IAudioSessionControl newSessionControl)
     {
         AudioSessionControl? session = null;
         var shouldRaise = false;
@@ -548,7 +575,7 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         {
             session = new AudioSessionControl(newSessionControl);
 
-            if (TryTrackSessionCore(session, flow))
+            if (TryTrackSessionCore(session, flow, deviceId))
             {
                 session = null;
                 shouldRaise = true;
@@ -574,12 +601,14 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
             QueueSessionRemoval(sessionId, flow);
     }
 
-    private void HandleSessionVolumeChanged(string sessionKey, EDataFlow flow, float volume, bool isMuted)
+    private void HandleSessionVolumeChanged(string sessionKey, EDataFlow flow, string deviceId, float volume, bool isMuted)
     {
         if (disposed)
             return;
 
-        SessionVolumeChanged?.Invoke(this, new ObservedSessionVolumeChangedEventArgs(sessionKey, flow, volume, isMuted));
+        SessionVolumeChanged?.Invoke(
+            this,
+            new ObservedSessionVolumeChangedEventArgs(sessionKey, flow, deviceId, volume, isMuted));
     }
 
     private void HandleSessionDisplayNameChanged(string sessionKey, EDataFlow flow, string? displayName)
@@ -590,12 +619,16 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         SessionDisplayNameChanged?.Invoke(this, new ObservedSessionDisplayNameChangedEventArgs(sessionKey, flow, displayName));
     }
 
-    private void HandleMasterVolumeNotification(float volume, bool isMuted)
+    private void HandleMasterVolumeNotification(
+        float volume,
+        bool isMuted,
+        string deviceId,
+        string deviceName)
     {
         if (disposed)
             return;
 
-        RaiseMasterVolumeChanged(MasterVolumeService.CreateState(volume, isMuted));
+        RaiseMasterVolumeChanged(MasterVolumeService.CreateState(volume, isMuted, deviceId, deviceName));
     }
 
     private void RemoveSessionAndRaiseStructureChanged(string sessionId, EDataFlow flow)
@@ -769,12 +802,19 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
 
     private sealed class DeviceRegistration : IDisposable
     {
-        public DeviceRegistration(MMDevice device, AudioSessionManager sessionManager, AudioSessionManager.SessionCreatedDelegate sessionCreatedHandler)
+        public DeviceRegistration(
+            string deviceId,
+            MMDevice device,
+            AudioSessionManager sessionManager,
+            AudioSessionManager.SessionCreatedDelegate sessionCreatedHandler)
         {
+            DeviceId = deviceId;
             Device = device;
             SessionManager = sessionManager;
             SessionCreatedHandler = sessionCreatedHandler;
         }
+
+        public string DeviceId { get; }
 
         public MMDevice Device { get; }
 
@@ -800,11 +840,18 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
 
     private sealed class SessionRegistration : IDisposable
     {
-        public SessionRegistration(string sessionId, string sessionKey, EDataFlow flow, AudioSessionControl session, SessionEventsHandler handler)
+        public SessionRegistration(
+            string sessionId,
+            string sessionKey,
+            EDataFlow flow,
+            string deviceId,
+            AudioSessionControl session,
+            SessionEventsHandler handler)
         {
             SessionId = sessionId;
             SessionKey = sessionKey;
             Flow = flow;
+            DeviceId = deviceId;
             Session = session;
             Handler = handler;
         }
@@ -814,6 +861,8 @@ internal sealed class AudioChangeMonitor : IMMNotificationClient, IDisposable
         public string SessionKey { get; }
 
         public EDataFlow Flow { get; }
+
+        public string DeviceId { get; }
 
         public AudioSessionControl Session { get; }
 

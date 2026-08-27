@@ -26,7 +26,13 @@ public sealed partial class MainWindow : Window
     private static readonly TimeSpan InitialSnapshotWarmupWait = TimeSpan.FromMilliseconds(160);
     private static readonly TimeSpan MasterVolumePollInterval = TimeSpan.FromMilliseconds(400);
     private static readonly TimeSpan MasterVolumePollQuietWindow = TimeSpan.FromMilliseconds(900);
-    private static readonly Guid TrayIconGuid = new("05F26E47-7F95-4C1C-B0E6-4D748C6CFB6F");
+    private static readonly TimeSpan[] RoutedSessionStateRestoreRetryDelays =
+    [
+        TimeSpan.Zero,
+        TimeSpan.FromMilliseconds(120),
+        TimeSpan.FromMilliseconds(300),
+        TimeSpan.FromMilliseconds(600)
+    ];
     private const uint TrayIconId = 1;
     private const uint TrayCallbackMessage = NativeMethods.WmApp + 1;
 
@@ -42,9 +48,11 @@ public sealed partial class MainWindow : Window
     private readonly Dictionary<string, SessionCardControl> sessionCards = new(StringComparer.OrdinalIgnoreCase);
     private readonly object masterVolumeUpdateSync = new();
     private readonly object sessionVolumeUpdateSync = new();
-    private readonly object sessionVolumeCommitSync = new();
+    private readonly object sessionStateCommitSync = new();
     private readonly Dictionary<string, ObservedSessionVolumeChangedEventArgs> pendingObservedSessionVolumeChanges = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, PendingSessionVolumeCommit> pendingSessionVolumeCommits = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, PendingSessionStateCommit> pendingSessionStateCommits = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, PendingRoutedSessionStateRestore> pendingRoutedSessionStateRestores = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> routedSessionStateRestoresInFlight = new(StringComparer.OrdinalIgnoreCase);
     private AppWindow? appWindow;
     private IntPtr hwnd;
     private bool isConfigured;
@@ -64,7 +72,7 @@ public sealed partial class MainWindow : Window
     private Task? latestRefreshTask;
     private bool isMasterVolumeUpdateQueued;
     private bool isSessionVolumeUpdateQueued;
-    private bool isSessionVolumeCommitFlushRunning;
+    private bool isSessionStateCommitFlushRunning;
     private bool isMasterVolumePollInFlight;
     private long lastObservedMasterVolumeEventTick;
     private WndProcDelegate? windowProcDelegate;
@@ -83,12 +91,14 @@ public sealed partial class MainWindow : Window
         InitializeComponent();
         refreshDispatcher = new StaThreadDispatcher("AudioRoute.Refresh");
         trayDispatcher = new StaThreadDispatcher("AudioRoute.Tray");
-        trayIconHost = new ShellNotifyIconHost(TrayIconGuid, TrayIconId, TrayCallbackMessage);
+        trayIconHost = new ShellNotifyIconHost(TrayIconId, TrayCallbackMessage);
         trayIconManager = new TrayIconManager(() => hwnd, trayIconHost, DispatcherQueue);
         trayIconManager.TogglePanelRequested += () => { _ = TogglePanelVisibilityAsync(); return Task.CompletedTask; };
         trayIconManager.ShowPanelRequested += () => { _ = ShowOrBringToFrontAsync(); return Task.CompletedTask; };
         trayIconManager.ExitRequested += RequestExit;
         trayIconManager.ErrorOccurred += ShowError;
+        trayIconManager.MasterVolumeAdjustmentRequested += delta => _ = AdjustMasterVolumeFromTrayAsync(delta);
+        trayIconManager.MasterMuteToggleRequested += () => _ = ToggleMasterMuteFromTrayAsync();
         ConfigureWindow();
 
         Activated += OnWindowActivated;
@@ -180,6 +190,7 @@ public sealed partial class MainWindow : Window
         isConfigured = true;
         panelController.AttachForegroundEventHook();
         trayIconManager.Initialize();
+        ApplyMasterVolumeState(MasterVolumeService.TryGetMasterVolumeState());
         masterVolumePollTimer.Start();
         RefreshData();
     }
@@ -212,7 +223,7 @@ public sealed partial class MainWindow : Window
 
         lock (sessionVolumeUpdateSync)
         {
-            pendingObservedSessionVolumeChanges[CreateSessionFlowKey(e.SessionKey, e.Flow)] = e;
+            pendingObservedSessionVolumeChanges[CreateSessionFlowDeviceKey(e.SessionKey, e.Flow, e.DeviceId)] = e;
             if (isSessionVolumeUpdateQueued)
                 return;
 
@@ -287,6 +298,8 @@ public sealed partial class MainWindow : Window
         ScheduleAudioRefresh(
             canReuseDevices: lastSnapshot is not null,
             scope: GetRefreshScope(e.Flow));
+
+        RetryPendingRoutedSessionStateRestores(e.Flow);
     }
 
     private void HandleObservedSessionVolumeChanged(ObservedSessionVolumeChangedEventArgs e)
@@ -294,13 +307,13 @@ public sealed partial class MainWindow : Window
         if (isExitRequested)
             return;
 
-        UpdateCachedSessionVolume(e.SessionKey, e.Flow, e.Volume, e.IsMuted);
+        UpdateCachedSessionState(e.SessionKey, e.Flow, e.DeviceId, e.Volume, e.IsMuted);
 
         if (!panelController.IsPanelVisible)
             return;
 
         if (sessionCards.TryGetValue(e.SessionKey, out var card))
-            card.ApplyObservedVolume(e.Flow, e.Volume, e.IsMuted);
+            card.ApplyObservedVolume(e.Flow, e.DeviceId, e.Volume, e.IsMuted);
     }
 
     private void FlushObservedSessionVolumeChanged()
@@ -325,11 +338,10 @@ public sealed partial class MainWindow : Window
 
     private void HandleObservedMasterVolumeChanged(ObservedMasterVolumeChangedEventArgs e)
     {
-        if (isExitRequested || !trayIconManager.IsCreated)
+        if (isExitRequested)
             return;
 
-        if (trayIconManager.ShouldQueueTrayIconUpdate(e.State))
-            trayIconManager.ScheduleTrayIconUpdate(e.State, force: true);
+        ApplyMasterVolumeState(e.State);
     }
 
     private void FlushObservedMasterVolumeChanged()
@@ -345,9 +357,58 @@ public sealed partial class MainWindow : Window
         HandleObservedMasterVolumeChanged(new ObservedMasterVolumeChangedEventArgs(currentState));
     }
 
+    private void ApplyMasterVolumeState(MasterVolumeState? state)
+    {
+        if (trayIconManager.IsCreated && trayIconManager.ShouldQueueTrayIconUpdate(state))
+            trayIconManager.ScheduleTrayIconUpdate(state, force: true);
+    }
+
+    private async Task AdjustMasterVolumeFromTrayAsync(int deltaPercentage)
+    {
+        try
+        {
+            var updatedState = await trayDispatcher.InvokeAsync(() =>
+                MasterVolumeService.TryAdjustMasterVolume(deltaPercentage));
+            if (isExitRequested || updatedState is not MasterVolumeState state)
+                return;
+
+            ApplyMasterVolumeState(state);
+            RuntimeLog.Write(
+                $"托盘滚轮调整主音量: delta={deltaPercentage}, " +
+                $"state={TrayIconManager.FormatMasterVolumeStateForLog(state)}");
+        }
+        catch (Exception ex)
+        {
+            RuntimeLog.WriteException("托盘滚轮调整主音量失败", ex);
+        }
+    }
+
+    private async Task ToggleMasterMuteFromTrayAsync()
+    {
+        try
+        {
+            var updatedState = await trayDispatcher.InvokeAsync(MasterVolumeService.TryToggleMasterMute);
+            if (isExitRequested || updatedState is not MasterVolumeState state)
+                return;
+
+            ApplyMasterVolumeState(state);
+            RuntimeLog.Write(
+                $"托盘中键切换主静音: state={TrayIconManager.FormatMasterVolumeStateForLog(state)}");
+        }
+        catch (Exception ex)
+        {
+            RuntimeLog.WriteException("托盘中键切换主静音失败", ex);
+        }
+    }
+
     private static string CreateSessionFlowKey(string sessionKey, EDataFlow flow)
     {
         return $"{(int)flow}:{sessionKey}";
+    }
+
+    private static string CreateSessionFlowDeviceKey(string sessionKey, EDataFlow flow, string deviceId)
+    {
+        return $"{(int)flow}:{deviceId}:{sessionKey}";
     }
 
     private void HandleObservedSessionDisplayNameChanged(ObservedSessionDisplayNameChangedEventArgs e)
@@ -540,6 +601,21 @@ public sealed partial class MainWindow : Window
         var inputSessions = (scope & RefreshSessionScope.Capture) != 0
             ? AudioSessionService.GetActiveSessions(EDataFlow.eCapture, CreateDeviceMap(devices, EDataFlow.eCapture))
             : GetSessionsForFlow(cachedSnapshot!, EDataFlow.eCapture);
+
+        if (cachedSnapshot is not null)
+        {
+            outputSessions = PreserveKnownDeviceStates(
+                outputSessions,
+                GetSessionsForFlow(cachedSnapshot, EDataFlow.eRender),
+                devices,
+                EDataFlow.eRender);
+            inputSessions = PreserveKnownDeviceStates(
+                inputSessions,
+                GetSessionsForFlow(cachedSnapshot, EDataFlow.eCapture),
+                devices,
+                EDataFlow.eCapture);
+        }
+
         var sessions = MergeSessions(outputSessions, inputSessions);
 
         return new PanelSnapshot(devices, sessions);
@@ -557,6 +633,45 @@ public sealed partial class MainWindow : Window
         }
 
         return sessions;
+    }
+
+    private static IReadOnlyList<MixerSessionInfo> PreserveKnownDeviceStates(
+        IReadOnlyList<MixerSessionInfo> currentSessions,
+        IReadOnlyList<MixerSessionInfo> previousSessions,
+        IReadOnlyList<AudioDevice> devices,
+        EDataFlow flow)
+    {
+        var previousMap = previousSessions.ToDictionary(
+            session => session.SessionKey,
+            StringComparer.OrdinalIgnoreCase);
+        var defaultDeviceId = devices.FirstOrDefault(device => device.Flow == flow && device.IsDefault)?.Id;
+        var mergedSessions = new List<MixerSessionInfo>(currentSessions.Count);
+
+        foreach (var session in currentSessions)
+        {
+            if (!previousMap.TryGetValue(session.SessionKey, out var previousSession))
+            {
+                mergedSessions.Add(session);
+                continue;
+            }
+
+            var statesByDevice = previousSession.DeviceStates.ToDictionary(
+                state => state.DeviceId,
+                StringComparer.OrdinalIgnoreCase);
+            foreach (var state in session.DeviceStates)
+                statesByDevice[state.DeviceId] = state;
+
+            var merged = session with
+            {
+                DeviceStates = statesByDevice.Values
+                    .OrderBy(state => state.DeviceName, StringComparer.CurrentCultureIgnoreCase)
+                    .ToList()
+            };
+            var preferredDeviceId = merged.BoundDeviceId ?? defaultDeviceId ?? merged.VolumeDeviceId;
+            mergedSessions.Add(merged.SelectVolumeDevice(preferredDeviceId));
+        }
+
+        return mergedSessions;
     }
 
     private static RefreshSessionScope GetRefreshScope(EDataFlow flow)
@@ -591,7 +706,7 @@ public sealed partial class MainWindow : Window
             {
                 card = new SessionCardControl(session, snapshot.Devices);
                 card.DeviceChanged += OnDeviceChanged;
-                card.VolumeChanged += OnVolumeChanged;
+                card.SessionStateChanged += OnSessionStateChanged;
                 card.InteractionStateChanged += OnInteractionStateChanged;
                 sessionCards.Add(session.SessionKey, card);
             }
@@ -712,6 +827,14 @@ public sealed partial class MainWindow : Window
                 return;
             }
 
+            var selectedDeviceId = e.DeviceId ?? lastSnapshot?.Devices.FirstOrDefault(device =>
+                device.Flow == e.Session.Flow && device.IsDefault)?.Id;
+            var cachedSession = lastSnapshot?.Sessions.FirstOrDefault(session =>
+                string.Equals(session.SessionKey, e.Session.SessionKey, StringComparison.OrdinalIgnoreCase))
+                ?.GetSession(e.Session.Flow) ?? e.Session;
+            var rememberedDeviceState = cachedSession.DeviceStates.FirstOrDefault(state =>
+                string.Equals(state.DeviceId, selectedDeviceId, StringComparison.OrdinalIgnoreCase));
+
             if (string.IsNullOrWhiteSpace(e.DeviceId))
                 await AudioPolicyManager.ClearAppDefaultDeviceAsync((uint)e.Session.ProcessId, e.Session.Flow);
             else
@@ -722,6 +845,16 @@ public sealed partial class MainWindow : Window
 
             if (panelController.IsPanelVisible)
                 ScheduleAudioRefresh(canReuseDevices: true, scope: GetRefreshScope(e.Session.Flow));
+
+            if (!string.IsNullOrWhiteSpace(selectedDeviceId) && rememberedDeviceState is not null)
+            {
+                QueueRoutedSessionStateRestore(new PendingRoutedSessionStateRestore(
+                    e.Session.SessionKey,
+                    e.Session.Flow,
+                    selectedDeviceId,
+                    rememberedDeviceState.Volume,
+                    rememberedDeviceState.IsMuted));
+            }
         }
         catch (Exception ex)
         {
@@ -733,49 +866,181 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private void OnVolumeChanged(object? sender, MixerVolumeChangedEventArgs e)
+    private void QueueRoutedSessionStateRestore(PendingRoutedSessionStateRestore restore)
     {
-        var shouldStartFlush = false;
-        lock (sessionVolumeCommitSync)
-        {
-            pendingSessionVolumeCommits[CreateSessionFlowKey(e.Session.SessionKey, e.Session.Flow)] =
-                new PendingSessionVolumeCommit(e, sender as SessionCardControl);
+        var restoreKey = CreateSessionFlowDeviceKey(restore.SessionKey, restore.Flow, restore.DeviceId);
+        pendingRoutedSessionStateRestores[restoreKey] = restore;
+        if (!routedSessionStateRestoresInFlight.Add(restoreKey))
+            return;
 
-            if (!isSessionVolumeCommitFlushRunning)
+        _ = RestoreRoutedSessionStateAsync(restoreKey);
+    }
+
+    private void RetryPendingRoutedSessionStateRestores(EDataFlow flow)
+    {
+        foreach (var restore in pendingRoutedSessionStateRestores.Values.Where(restore => restore.Flow == flow).ToList())
+            QueueRoutedSessionStateRestore(restore);
+    }
+
+    private async Task RestoreRoutedSessionStateAsync(string restoreKey)
+    {
+        PendingRoutedSessionStateRestore? lastAttemptedRestore = null;
+        try
+        {
+            if (!pendingRoutedSessionStateRestores.TryGetValue(restoreKey, out var restore))
+                return;
+
+            foreach (var delay in RoutedSessionStateRestoreRetryDelays)
             {
-                isSessionVolumeCommitFlushRunning = true;
+                if (isExitRequested || !pendingRoutedSessionStateRestores.TryGetValue(restoreKey, out restore))
+                    return;
+
+                if (delay > TimeSpan.Zero)
+                    await Task.Delay(delay);
+
+                if (isExitRequested || !pendingRoutedSessionStateRestores.TryGetValue(restoreKey, out restore))
+                    return;
+
+                lastAttemptedRestore = restore;
+
+                bool restored;
+                try
+                {
+                    restored = await refreshDispatcher.InvokeAsync(() =>
+                    {
+                        try
+                        {
+                            if (audioChangeMonitor.TrySetSessionState(
+                                    restore.SessionKey,
+                                    restore.Flow,
+                                    restore.DeviceId,
+                                    restore.Volume,
+                                    restore.IsMuted))
+                            {
+                                return true;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            RuntimeLog.WriteException(
+                                $"路由切换后快速恢复会话状态失败: session={restore.SessionKey}, " +
+                                $"flow={restore.Flow}, device={restore.DeviceId}",
+                                ex);
+                        }
+
+                        return AudioSessionService.SetSessionState(
+                            restore.SessionKey,
+                            restore.Flow,
+                            restore.DeviceId,
+                            restore.Volume,
+                            restore.IsMuted);
+                    });
+                }
+                catch (Exception ex)
+                {
+                    RuntimeLog.WriteException(
+                        $"路由切换后恢复会话状态失败: session={restore.SessionKey}, " +
+                        $"flow={restore.Flow}, device={restore.DeviceId}",
+                        ex);
+                    return;
+                }
+
+                if (restored)
+                {
+                    if (pendingRoutedSessionStateRestores.TryGetValue(restoreKey, out var currentRestore) &&
+                        currentRestore != restore)
+                    {
+                        continue;
+                    }
+
+                    pendingRoutedSessionStateRestores.Remove(restoreKey);
+                    RuntimeLog.Write(
+                        $"路由切换后已恢复设备会话状态: session={restore.SessionKey}, " +
+                        $"flow={restore.Flow}, device={restore.DeviceId}, volume={restore.Volume:F3}, mute={restore.IsMuted}");
+                    return;
+                }
+            }
+
+            RuntimeLog.Write(
+                $"路由切换后本轮未发现目标设备会话，继续保留设备状态记忆: " +
+                $"session={restore.SessionKey}, flow={restore.Flow}, " +
+                $"device={restore.DeviceId}, volume={restore.Volume:F3}, mute={restore.IsMuted}");
+        }
+        finally
+        {
+            routedSessionStateRestoresInFlight.Remove(restoreKey);
+
+            if (!isExitRequested &&
+                lastAttemptedRestore is not null &&
+                pendingRoutedSessionStateRestores.TryGetValue(restoreKey, out var currentRestore) &&
+                currentRestore != lastAttemptedRestore)
+            {
+                QueueRoutedSessionStateRestore(currentRestore);
+            }
+        }
+    }
+
+    private void OnSessionStateChanged(object? sender, MixerSessionStateChangedEventArgs e)
+    {
+        if (!string.IsNullOrWhiteSpace(e.Session.VolumeDeviceId))
+        {
+            var restoreKey = CreateSessionFlowDeviceKey(
+                e.Session.SessionKey,
+                e.Session.Flow,
+                e.Session.VolumeDeviceId);
+            if (pendingRoutedSessionStateRestores.ContainsKey(restoreKey))
+            {
+                pendingRoutedSessionStateRestores[restoreKey] = new PendingRoutedSessionStateRestore(
+                    e.Session.SessionKey,
+                    e.Session.Flow,
+                    e.Session.VolumeDeviceId,
+                    e.Volume,
+                    e.IsMuted);
+            }
+        }
+
+        var shouldStartFlush = false;
+        lock (sessionStateCommitSync)
+        {
+            pendingSessionStateCommits[CreateSessionFlowKey(e.Session.SessionKey, e.Session.Flow)] =
+                new PendingSessionStateCommit(e, sender as SessionCardControl);
+
+            if (!isSessionStateCommitFlushRunning)
+            {
+                isSessionStateCommitFlushRunning = true;
                 shouldStartFlush = true;
             }
         }
 
         if (shouldStartFlush)
-            _ = FlushPendingSessionVolumeCommitsAsync();
+            _ = FlushPendingSessionStateCommitsAsync();
     }
 
-    private async Task FlushPendingSessionVolumeCommitsAsync()
+    private async Task FlushPendingSessionStateCommitsAsync()
     {
         while (!isExitRequested)
         {
-            List<PendingSessionVolumeCommit> pendingCommits;
-            lock (sessionVolumeCommitSync)
+            List<PendingSessionStateCommit> pendingCommits;
+            lock (sessionStateCommitSync)
             {
-                if (pendingSessionVolumeCommits.Count == 0)
+                if (pendingSessionStateCommits.Count == 0)
                 {
-                    isSessionVolumeCommitFlushRunning = false;
+                    isSessionStateCommitFlushRunning = false;
                     return;
                 }
 
-                pendingCommits = pendingSessionVolumeCommits.Values.ToList();
-                pendingSessionVolumeCommits.Clear();
+                pendingCommits = pendingSessionStateCommits.Values.ToList();
+                pendingSessionStateCommits.Clear();
             }
 
-            SessionVolumeCommitBatchResult result;
+            SessionStateCommitBatchResult result;
             try
             {
                 result = await refreshDispatcher.InvokeAsync(() =>
                 {
-                    var succeeded = new List<PendingSessionVolumeCommit>(pendingCommits.Count);
-                    var failures = new List<SessionVolumeCommitFailure>();
+                    var succeeded = new List<PendingSessionStateCommit>(pendingCommits.Count);
+                    var deferred = new List<PendingSessionStateCommit>();
+                    var failures = new List<SessionStateCommitFailure>();
 
                     foreach (var pendingCommit in pendingCommits)
                     {
@@ -785,38 +1050,82 @@ public sealed partial class MainWindow : Window
                             var updated = false;
                             try
                             {
-                                updated = audioChangeMonitor.TrySetSessionVolume(change.Session.SessionKey, change.Session.Flow, change.Volume);
+                                updated = audioChangeMonitor.TrySetSessionState(
+                                    change.Session.SessionKey,
+                                    change.Session.Flow,
+                                    change.Session.VolumeDeviceId,
+                                    change.Volume,
+                                    change.IsMuted);
                             }
                             catch (Exception ex)
                             {
-                                RuntimeLog.WriteException("快速调节音量路径失败，回退到枚举路径", ex);
+                                RuntimeLog.WriteException("快速调节会话状态路径失败，回退到枚举路径", ex);
                             }
 
                             if (!updated)
-                                AudioSessionService.SetSessionVolume(change.Session.SessionKey, change.Session.Flow, change.Volume);
+                            {
+                                updated = AudioSessionService.SetSessionState(
+                                    change.Session.SessionKey,
+                                    change.Session.Flow,
+                                    change.Session.VolumeDeviceId,
+                                    change.Volume,
+                                    change.IsMuted);
+                            }
 
-                            succeeded.Add(pendingCommit);
+                            if (updated || string.IsNullOrWhiteSpace(change.Session.VolumeDeviceId))
+                                succeeded.Add(pendingCommit);
+                            else
+                                deferred.Add(pendingCommit);
                         }
                         catch (Exception ex)
                         {
-                            failures.Add(new SessionVolumeCommitFailure(pendingCommit, ex));
+                            failures.Add(new SessionStateCommitFailure(pendingCommit, ex));
                         }
                     }
 
-                    return new SessionVolumeCommitBatchResult(succeeded, failures);
+                    return new SessionStateCommitBatchResult(succeeded, deferred, failures);
                 });
             }
             catch (Exception ex)
             {
-                result = new SessionVolumeCommitBatchResult(
-                    Array.Empty<PendingSessionVolumeCommit>(),
-                    pendingCommits.Select(commit => new SessionVolumeCommitFailure(commit, ex)).ToArray());
+                result = new SessionStateCommitBatchResult(
+                    Array.Empty<PendingSessionStateCommit>(),
+                    Array.Empty<PendingSessionStateCommit>(),
+                    pendingCommits.Select(commit => new SessionStateCommitFailure(commit, ex)).ToArray());
             }
 
-            foreach (var succeededCommit in result.Succeeded)
+            foreach (var succeededCommit in result.Succeeded.Concat(result.Deferred))
             {
                 var change = succeededCommit.Change;
-                UpdateCachedSessionVolume(change.Session.SessionKey, change.Session.Flow, change.Volume, isMuted: change.Volume <= 0.005f);
+                UpdateCachedSessionState(
+                    change.Session.SessionKey,
+                    change.Session.Flow,
+                    change.Session.VolumeDeviceId ?? string.Empty,
+                    change.Volume,
+                    change.IsMuted);
+
+                if (!string.IsNullOrWhiteSpace(change.Session.VolumeDeviceId))
+                {
+                    var restoreKey = CreateSessionFlowDeviceKey(
+                        change.Session.SessionKey,
+                        change.Session.Flow,
+                        change.Session.VolumeDeviceId);
+                    pendingRoutedSessionStateRestores.Remove(restoreKey);
+                }
+            }
+
+            foreach (var deferredCommit in result.Deferred)
+            {
+                var change = deferredCommit.Change;
+                if (!string.IsNullOrWhiteSpace(change.Session.VolumeDeviceId))
+                {
+                    QueueRoutedSessionStateRestore(new PendingRoutedSessionStateRestore(
+                        change.Session.SessionKey,
+                        change.Session.Flow,
+                        change.Session.VolumeDeviceId,
+                        change.Volume,
+                        change.IsMuted));
+                }
             }
 
             if (result.Failures.Count == 0)
@@ -824,15 +1133,15 @@ public sealed partial class MainWindow : Window
 
             foreach (var failure in result.Failures)
             {
-                failure.Commit.SourceCard?.NotifyVolumeCommitFailed();
+                failure.Commit.SourceCard?.NotifySessionStateCommitFailed();
                 RuntimeLog.WriteException(
-                    $"主页调节音量失败: session={failure.Commit.Change.Session.SessionKey}, flow={failure.Commit.Change.Session.Flow}",
+                    $"主页调节会话状态失败: session={failure.Commit.Change.Session.SessionKey}, flow={failure.Commit.Change.Session.Flow}",
                     failure.Exception);
             }
 
             hasDeferredRefresh = true;
             RefreshData();
-            ShowError($"调整音量失败: {result.Failures[0].Exception.Message}");
+            ShowError($"调整会话状态失败: {result.Failures[0].Exception.Message}");
         }
     }
 
@@ -1008,7 +1317,12 @@ public sealed partial class MainWindow : Window
         windowProcDelegate = null;
     }
 
-    private void UpdateCachedSessionVolume(string sessionKey, EDataFlow flow, float volume, bool isMuted)
+    private void UpdateCachedSessionState(
+        string sessionKey,
+        EDataFlow flow,
+        string deviceId,
+        float volume,
+        bool isMuted)
     {
         if (lastSnapshot is null)
             return;
@@ -1031,7 +1345,9 @@ public sealed partial class MainWindow : Window
                 continue;
             }
 
-            var updatedSession = session with { Volume = volume, IsMuted = isMuted };
+            var deviceName = lastSnapshot.Devices.FirstOrDefault(device =>
+                string.Equals(device.Id, deviceId, StringComparison.OrdinalIgnoreCase))?.Name ?? deviceId;
+            var updatedSession = session.WithDeviceVolume(deviceId, deviceName, volume, isMuted);
             var outputSession = flow == EDataFlow.eRender ? updatedSession : appSession.OutputSession;
             var inputSession = flow == EDataFlow.eCapture ? updatedSession : appSession.InputSession;
 
@@ -1076,7 +1392,13 @@ public sealed partial class MainWindow : Window
                 continue;
             }
 
-            var updatedSession = session with { BoundDeviceId = boundDeviceId, BoundDeviceSummary = boundDeviceSummary };
+            var selectedDeviceId = boundDeviceId ?? lastSnapshot.Devices.FirstOrDefault(device =>
+                device.Flow == flow && device.IsDefault)?.Id;
+            var updatedSession = (session with
+            {
+                BoundDeviceId = boundDeviceId,
+                BoundDeviceSummary = boundDeviceSummary
+            }).SelectVolumeDevice(selectedDeviceId);
             var outputSession = flow == EDataFlow.eRender ? updatedSession : appSession.OutputSession;
             var inputSession = flow == EDataFlow.eCapture ? updatedSession : appSession.InputSession;
 
@@ -1278,9 +1600,17 @@ public sealed partial class MainWindow : Window
         {
             var card = sessionCards[key];
             card.DeviceChanged -= OnDeviceChanged;
-            card.VolumeChanged -= OnVolumeChanged;
+            card.SessionStateChanged -= OnSessionStateChanged;
             card.InteractionStateChanged -= OnInteractionStateChanged;
             sessionCards.Remove(key);
+
+            foreach (var restoreKey in pendingRoutedSessionStateRestores
+                         .Where(pair => string.Equals(pair.Value.SessionKey, key, StringComparison.OrdinalIgnoreCase))
+                         .Select(pair => pair.Key)
+                         .ToList())
+            {
+                pendingRoutedSessionStateRestores.Remove(restoreKey);
+            }
         }
     }
 

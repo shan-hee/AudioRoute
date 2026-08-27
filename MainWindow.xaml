@@ -21,7 +21,9 @@
             <ScrollViewer Margin="8,8,0,8"
                           VerticalScrollBarVisibility="Visible"
                           HorizontalScrollBarVisibility="Disabled">
-                    <StackPanel x:Name="SessionHost" Spacing="2" Padding="0,4,8,4" />
+                <StackPanel x:Name="SessionHost"
+                            Spacing="2"
+                            Padding="0,4,8,4" />
             </ScrollViewer>
         </Border>
     </Grid>

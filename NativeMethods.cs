@@ -44,6 +44,7 @@ internal static class NativeMethods
     public const uint WmCommand = 0x0111;
     public const uint WmContextMenu = 0x007B;
     public const uint WmLButtonUp = 0x0202;
+    public const uint WmMButtonUp = 0x0208;
     public const uint WmNull = 0x0000;
     public const uint WmRButtonUp = 0x0205;
     public const uint EventSystemForeground = 0x0003;

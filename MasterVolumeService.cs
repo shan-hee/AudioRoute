@@ -3,7 +3,12 @@ using NAudio.CoreAudioApi;
 
 namespace AudioRoute;
 
-public readonly record struct MasterVolumeState(int Percentage, bool IsMuted, TrayVolumeIconKind IconKind);
+public readonly record struct MasterVolumeState(
+    int Percentage,
+    bool IsMuted,
+    TrayVolumeIconKind IconKind,
+    string? DeviceId,
+    string? DeviceName);
 
 public enum TrayVolumeIconKind
 {
@@ -24,7 +29,11 @@ public static class MasterVolumeService
             using var enumerator = new MMDeviceEnumerator();
             using var device = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
 
-            return CreateState(device.AudioEndpointVolume.MasterVolumeLevelScalar, device.AudioEndpointVolume.Mute);
+            return CreateState(
+                device.AudioEndpointVolume.MasterVolumeLevelScalar,
+                device.AudioEndpointVolume.Mute,
+                device.ID,
+                device.FriendlyName);
         }
         catch
         {
@@ -32,14 +41,67 @@ public static class MasterVolumeService
         }
     }
 
-    public static MasterVolumeState CreateState(float volumeScalar, bool isMuted)
+    public static MasterVolumeState? TryAdjustMasterVolume(int deltaPercentage)
+    {
+        try
+        {
+            using var enumerator = new MMDeviceEnumerator();
+            using var device = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+            var endpointVolume = device.AudioEndpointVolume;
+            var currentPercentage = Math.Clamp(
+                (int)Math.Round(endpointVolume.MasterVolumeLevelScalar * 100),
+                0,
+                100);
+            var nextPercentage = Math.Clamp(currentPercentage + deltaPercentage, 0, 100);
+            endpointVolume.MasterVolumeLevelScalar = nextPercentage / 100f;
+
+            return CreateState(
+                endpointVolume.MasterVolumeLevelScalar,
+                endpointVolume.Mute,
+                device.ID,
+                device.FriendlyName);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public static MasterVolumeState? TryToggleMasterMute()
+    {
+        try
+        {
+            using var enumerator = new MMDeviceEnumerator();
+            using var device = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+            var endpointVolume = device.AudioEndpointVolume;
+            endpointVolume.Mute = !endpointVolume.Mute;
+
+            return CreateState(
+                endpointVolume.MasterVolumeLevelScalar,
+                endpointVolume.Mute,
+                device.ID,
+                device.FriendlyName);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public static MasterVolumeState CreateState(
+        float volumeScalar,
+        bool isMuted,
+        string? deviceId = null,
+        string? deviceName = null)
     {
         var percentage = Math.Clamp((int)Math.Round(volumeScalar * 100), 0, 100);
 
         return new MasterVolumeState(
             percentage,
             isMuted,
-            ResolveIconKind(percentage, isMuted));
+            ResolveIconKind(percentage, isMuted),
+            deviceId,
+            deviceName);
     }
 
     private static TrayVolumeIconKind ResolveIconKind(int percentage, bool isMuted)
